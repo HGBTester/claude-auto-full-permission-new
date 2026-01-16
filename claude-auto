@@ -1,62 +1,194 @@
 #!/usr/bin/env python3
 """
-claude-auto: A wrapper for claude CLI with auto-accept functionality.
+claude-auto: A cross-platform wrapper for claude CLI with auto-accept functionality.
 
-When AUTO_ACCEPT is enabled, automatically sends "1" to accept prompts.
+When AUTO_ACCEPT is enabled, automatically selects the most aggressive option:
+- Prefers "Yes, and don't ask again" over simple "Yes"
+- Falls back to "Yes" if no "don't ask again" option exists
 """
 
 import argparse
 import os
 import sys
 import re
-import select
+import shutil
 import subprocess
-import pty
-import termios
-import tty
-import signal
+import threading
+import time
+import platform
 
-# ANSI color codes
-GREEN = "\033[92m"
-YELLOW = "\033[93m"
-RED = "\033[91m"
-CYAN = "\033[96m"
-RESET = "\033[0m"
+# Detect platform
+IS_WINDOWS = platform.system() == "Windows"
 
-# Only trigger on this exact prompt
-ACCEPT_PATTERNS = [
-    r'Do you want to proceed\?',
-]
+# ANSI color codes (disabled on Windows CMD without colorama)
+if IS_WINDOWS:
+    try:
+        import colorama
+        colorama.init()
+        GREEN = "\033[92m"
+        YELLOW = "\033[93m"
+        RED = "\033[91m"
+        CYAN = "\033[96m"
+        RESET = "\033[0m"
+    except ImportError:
+        GREEN = YELLOW = RED = CYAN = RESET = ""
+else:
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    RED = "\033[91m"
+    CYAN = "\033[96m"
+    RESET = "\033[0m"
+
 
 def print_status(msg, color=CYAN):
-    """Print status message to stderr so it doesn't interfere with claude output."""
+    """Print status message to stderr."""
     sys.stderr.write(f"{color}[claude-auto]{RESET} {msg}\n")
     sys.stderr.flush()
 
-def should_auto_accept(data):
-    """Check if the output contains a prompt that should be auto-accepted."""
-    for pattern in ACCEPT_PATTERNS:
-        if re.search(pattern, data, re.IGNORECASE | re.MULTILINE):
-            return True
-    return False
 
-def run_claude_with_auto_accept(claude_args, auto_accept=True, auto_response="1"):
-    """Run claude command with optional auto-accept functionality."""
+def find_claude():
+    """Find claude executable in the system."""
+    # Common names for claude executable
+    names = ["claude", "claude.exe"] if IS_WINDOWS else ["claude"]
 
-    # Build the command
-    cmd = ["claude"] + claude_args
+    # First try: use shutil.which (searches PATH)
+    for name in names:
+        path = shutil.which(name)
+        if path:
+            return path
 
-    if auto_accept:
-        print_status(f"AUTO-ACCEPT: {GREEN}ON{RESET} (will press Enter automatically)", GREEN)
+    # Second try: common installation locations
+    if IS_WINDOWS:
+        common_paths = [
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\claude\claude.exe"),
+            os.path.expandvars(r"%APPDATA%\npm\claude.cmd"),
+            os.path.expandvars(r"%APPDATA%\npm\claude"),
+            os.path.expanduser(r"~\.claude\claude.exe"),
+            r"C:\Program Files\claude\claude.exe",
+            r"C:\Program Files (x86)\claude\claude.exe",
+        ]
     else:
-        print_status(f"AUTO-ACCEPT: {RED}OFF{RESET} (manual mode)", YELLOW)
+        common_paths = [
+            "/usr/local/bin/claude",
+            "/usr/bin/claude",
+            os.path.expanduser("~/.local/bin/claude"),
+            os.path.expanduser("~/.npm-global/bin/claude"),
+            "/opt/claude/claude",
+            os.path.expanduser("~/.claude/claude"),
+        ]
 
+    for path in common_paths:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+
+    # Third try: npm global
+    try:
+        if IS_WINDOWS:
+            result = subprocess.run(["npm", "root", "-g"], capture_output=True, text=True)
+        else:
+            result = subprocess.run(["npm", "root", "-g"], capture_output=True, text=True)
+        if result.returncode == 0:
+            npm_path = os.path.join(result.stdout.strip(), ".bin", "claude")
+            if os.path.isfile(npm_path):
+                return npm_path
+    except:
+        pass
+
+    return None
+
+
+def analyze_prompt_options(text):
+    """
+    Analyze the prompt to determine the best option to select.
+    Returns the key to send (arrow down + enter, or just enter, etc.)
+
+    Strategy: Select the most aggressive option
+    - "don't ask again" > "Yes" > anything else
+    """
+    # Check for "don't ask again" patterns (usually option 2)
+    dont_ask_patterns = [
+        r"don't ask again",
+        r"don.t ask again",
+        r"always allow",
+        r"allow always",
+        r"remember this",
+        r"for this session",
+    ]
+
+    text_lower = text.lower()
+
+    # If there's a "don't ask again" type option, we want to select it
+    for pattern in dont_ask_patterns:
+        if re.search(pattern, text_lower):
+            # Usually option 2 is "don't ask again"
+            # Send down arrow then enter to select option 2
+            return "aggressive"
+
+    # Default: just press enter (selects option 1 which is usually "Yes")
+    return "default"
+
+
+class OutputMonitor:
+    """Monitor output and auto-respond to prompts."""
+
+    def __init__(self, auto_accept=True):
+        self.auto_accept = auto_accept
+        self.buffer = ""
+        self.last_response_pos = 0
+        self.lock = threading.Lock()
+        self.responded = False
+        self.response_cooldown = 0
+
+    def process_output(self, data, write_func):
+        """Process output data and check for prompts."""
+        with self.lock:
+            self.buffer += data
+
+            # Keep buffer manageable
+            if len(self.buffer) > 10000:
+                self.buffer = self.buffer[-5000:]
+                self.last_response_pos = max(0, self.last_response_pos - 5000)
+
+            # Check for prompt in new content
+            if self.auto_accept and time.time() > self.response_cooldown:
+                new_content = self.buffer[self.last_response_pos:]
+
+                if re.search(r'Do you want to proceed\?', new_content, re.IGNORECASE):
+                    # Determine best response
+                    action = analyze_prompt_options(new_content)
+
+                    # Delay to let prompt fully render
+                    time.sleep(0.5)
+
+                    if action == "aggressive":
+                        # Send down arrow to move to option 2, then enter
+                        # Down arrow is ESC [ B or just sending "2" might work
+                        write_func(b"\x1b[B")  # Down arrow
+                        time.sleep(0.1)
+                        write_func(b"\r")      # Enter
+                        print_status(f"Auto-selected: Option 2 (don't ask again)", GREEN)
+                    else:
+                        # Just press enter for option 1
+                        write_func(b"\r")
+                        print_status(f"Auto-selected: Option 1 (Yes)", GREEN)
+
+                    self.last_response_pos = len(self.buffer)
+                    self.response_cooldown = time.time() + 2  # 2 second cooldown
+
+
+def run_claude_unix(claude_path, claude_args, auto_accept=True):
+    """Run claude on Unix/Linux/Mac with PTY."""
+    import pty
+    import select
+    import termios
+    import tty
+
+    cmd = [claude_path] + claude_args
     print_status(f"Running: {' '.join(cmd)}")
 
     # Create pseudo-terminal
     master_fd, slave_fd = pty.openpty()
 
-    # Start the process
     process = subprocess.Popen(
         cmd,
         stdin=slave_fd,
@@ -73,105 +205,158 @@ def run_claude_with_auto_accept(claude_args, auto_accept=True, auto_response="1"
         old_settings = termios.tcgetattr(sys.stdin)
         tty.setraw(sys.stdin.fileno())
 
-    # Buffer to accumulate output for pattern matching
-    output_buffer = ""
-    last_auto_accept_pos = 0
+    monitor = OutputMonitor(auto_accept)
+
+    def write_to_master(data):
+        os.write(master_fd, data)
 
     try:
         while True:
-            # Wait for input from either the process or stdin
             rlist = [master_fd]
             if sys.stdin.isatty():
                 rlist.append(sys.stdin)
 
             try:
                 readable, _, _ = select.select(rlist, [], [], 0.1)
-            except select.error:
+            except:
                 break
 
-            # Check if process is still running
             if process.poll() is not None:
-                # Read any remaining output
                 try:
                     remaining = os.read(master_fd, 4096)
                     if remaining:
                         sys.stdout.buffer.write(remaining)
                         sys.stdout.buffer.flush()
-                except OSError:
+                except:
                     pass
                 break
 
-            # Handle output from claude
             if master_fd in readable:
                 try:
                     data = os.read(master_fd, 4096)
                     if not data:
                         break
 
-                    # Write to stdout
                     sys.stdout.buffer.write(data)
                     sys.stdout.buffer.flush()
 
-                    # Accumulate for pattern matching
                     try:
                         decoded = data.decode('utf-8', errors='replace')
-                        output_buffer += decoded
-
-                        # Keep buffer from growing too large
-                        if len(output_buffer) > 5000:
-                            output_buffer = output_buffer[-3000:]
-                            last_auto_accept_pos = max(0, last_auto_accept_pos - 2000)
-
-                        # Check for auto-accept patterns in new content
-                        if auto_accept:
-                            new_content = output_buffer[last_auto_accept_pos:]
-                            if should_auto_accept(new_content):
-                                # Delay to let the prompt fully render
-                                import time
-                                time.sleep(0.5)
-
-                                # Claude uses interactive menu - option 1 is already selected
-                                # Just send Enter (carriage return) to confirm
-                                os.write(master_fd, b"\r")
-                                print_status(f"Auto-accepted (pressed Enter)", GREEN)
-                                last_auto_accept_pos = len(output_buffer)
+                        monitor.process_output(decoded, write_to_master)
                     except:
                         pass
-
-                except OSError:
+                except:
                     break
 
-            # Handle input from user
             if sys.stdin in readable:
                 try:
                     user_input = os.read(sys.stdin.fileno(), 1024)
                     if user_input:
                         os.write(master_fd, user_input)
-                        # Reset auto-accept position when user types
-                        last_auto_accept_pos = len(output_buffer)
-                except OSError:
+                        monitor.last_response_pos = len(monitor.buffer)
+                except:
                     break
 
     except KeyboardInterrupt:
         process.terminate()
     finally:
-        # Restore terminal settings
         if old_settings:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
         os.close(master_fd)
 
     return process.returncode or 0
 
+
+def run_claude_windows(claude_path, claude_args, auto_accept=True):
+    """Run claude on Windows."""
+    import msvcrt
+
+    cmd = [claude_path] + claude_args
+    print_status(f"Running: {' '.join(cmd)}")
+
+    # On Windows, we use subprocess with pipes and threads
+    process = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=0
+    )
+
+    monitor = OutputMonitor(auto_accept)
+    stop_event = threading.Event()
+
+    def write_to_stdin(data):
+        try:
+            process.stdin.write(data)
+            process.stdin.flush()
+        except:
+            pass
+
+    def read_output():
+        """Read and display output from claude."""
+        while not stop_event.is_set():
+            try:
+                data = process.stdout.read(1)
+                if not data:
+                    break
+
+                sys.stdout.buffer.write(data)
+                sys.stdout.buffer.flush()
+
+                try:
+                    decoded = data.decode('utf-8', errors='replace')
+                    monitor.process_output(decoded, write_to_stdin)
+                except:
+                    pass
+            except:
+                break
+
+    def read_input():
+        """Read user input and send to claude."""
+        while not stop_event.is_set() and process.poll() is None:
+            try:
+                if msvcrt.kbhit():
+                    char = msvcrt.getch()
+                    process.stdin.write(char)
+                    process.stdin.flush()
+                    monitor.last_response_pos = len(monitor.buffer)
+                else:
+                    time.sleep(0.05)
+            except:
+                break
+
+    # Start threads
+    output_thread = threading.Thread(target=read_output, daemon=True)
+    input_thread = threading.Thread(target=read_input, daemon=True)
+
+    output_thread.start()
+    input_thread.start()
+
+    try:
+        process.wait()
+    except KeyboardInterrupt:
+        process.terminate()
+    finally:
+        stop_event.set()
+
+    return process.returncode or 0
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="claude-auto: Claude CLI wrapper with auto-accept",
+        description="claude-auto: Cross-platform Claude CLI wrapper with auto-accept",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  claude-auto "fix the bug"           # Run with auto-accept ON (default)
-  claude-auto --no-auto "fix bug"     # Run with auto-accept OFF
-  claude-auto --response 2 "query"    # Auto-send "2" instead of "1"
+  claude-auto "fix the bug"           # Auto-accept ON (aggressive mode)
+  claude-auto --no-auto "fix bug"     # Auto-accept OFF (manual mode)
   claude-auto -- --help               # Pass --help to claude
+
+Auto-accept behavior:
+  - Detects "Do you want to proceed?" prompts
+  - Prefers "Yes, and don't ask again" (option 2) when available
+  - Falls back to "Yes" (option 1) otherwise
         """
     )
 
@@ -182,28 +367,36 @@ Examples:
     )
 
     parser.add_argument(
-        "--response", "-r",
-        default="1",
-        help="Response to send automatically (default: 1)"
-    )
-
-    parser.add_argument(
         "claude_args",
         nargs="*",
         help="Arguments to pass to claude"
     )
 
     args = parser.parse_args()
-
     auto_accept = not args.no_auto
 
-    exit_code = run_claude_with_auto_accept(
-        args.claude_args,
-        auto_accept=auto_accept,
-        auto_response=args.response
-    )
+    # Find claude
+    claude_path = find_claude()
+    if not claude_path:
+        print_status("ERROR: Could not find 'claude' executable!", RED)
+        print_status("Make sure claude CLI is installed and in your PATH", YELLOW)
+        sys.exit(1)
+
+    print_status(f"Found claude: {claude_path}")
+
+    if auto_accept:
+        print_status(f"AUTO-ACCEPT: {GREEN}ON{RESET} (aggressive mode - prefers 'don't ask again')", GREEN)
+    else:
+        print_status(f"AUTO-ACCEPT: {RED}OFF{RESET} (manual mode)", YELLOW)
+
+    # Run with platform-specific implementation
+    if IS_WINDOWS:
+        exit_code = run_claude_windows(claude_path, args.claude_args, auto_accept)
+    else:
+        exit_code = run_claude_unix(claude_path, args.claude_args, auto_accept)
 
     sys.exit(exit_code)
+
 
 if __name__ == "__main__":
     main()
