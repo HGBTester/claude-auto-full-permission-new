@@ -128,6 +128,24 @@ def analyze_prompt_options(text):
     return "default"
 
 
+def is_plan_mode(text):
+    """Check if claude is currently in plan mode."""
+    plan_mode_patterns = [
+        r'plan mode',
+        r'\[plan\]',
+        r'planning mode',
+        r'Plan:',
+        r'enter plan mode',
+        r'exiting plan mode',
+        r'plan file',
+    ]
+    text_lower = text.lower()
+    for pattern in plan_mode_patterns:
+        if re.search(pattern, text_lower):
+            return True
+    return False
+
+
 class OutputMonitor:
     """Monitor output and auto-respond to prompts."""
 
@@ -138,6 +156,7 @@ class OutputMonitor:
         self.lock = threading.Lock()
         self.responded = False
         self.response_cooldown = 0
+        self.in_plan_mode = False
 
     def process_output(self, data, write_func):
         """Process output data and check for prompts."""
@@ -149,8 +168,19 @@ class OutputMonitor:
                 self.buffer = self.buffer[-5000:]
                 self.last_response_pos = max(0, self.last_response_pos - 5000)
 
-            # Check for prompt in new content
-            if self.auto_accept and time.time() > self.response_cooldown:
+            # Check for plan mode status changes
+            if is_plan_mode(data):
+                if not self.in_plan_mode:
+                    self.in_plan_mode = True
+                    print_status(f"Plan mode detected - auto-accept {YELLOW}PAUSED{RESET}", YELLOW)
+
+            # Detect exiting plan mode
+            if self.in_plan_mode and re.search(r'(exiting plan|exit plan|plan complete|approved)', data.lower()):
+                self.in_plan_mode = False
+                print_status(f"Plan mode ended - auto-accept {GREEN}RESUMED{RESET}", GREEN)
+
+            # Check for prompt in new content (only if NOT in plan mode)
+            if self.auto_accept and not self.in_plan_mode and time.time() > self.response_cooldown:
                 new_content = self.buffer[self.last_response_pos:]
 
                 if re.search(r'Do you want to proceed\?', new_content, re.IGNORECASE):
