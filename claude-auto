@@ -154,12 +154,38 @@ class OutputMonitor:
         self.buffer = ""
         self.last_response_pos = 0
         self.lock = threading.Lock()
-        self.responded = False
         self.response_cooldown = 0
         self.in_plan_mode = False
+        self.pending_response = None
+        self.write_func = None
+
+    def _send_response_delayed(self, action):
+        """Send response after a delay (runs in separate thread)."""
+        # Wait for prompt to fully render
+        time.sleep(1.0)
+
+        if self.write_func is None:
+            return
+
+        if action == "aggressive":
+            # Send down arrow to move to option 2, then enter
+            self.write_func(b"\x1b[B")  # Down arrow
+            time.sleep(0.15)
+            self.write_func(b"\r")      # Enter
+            time.sleep(0.05)
+            self.write_func(b"\n")      # Newline as backup
+            print_status(f"Auto-selected: Option 2 (don't ask again)", GREEN)
+        else:
+            # Just press enter for option 1
+            self.write_func(b"\r")
+            time.sleep(0.05)
+            self.write_func(b"\n")      # Newline as backup
+            print_status(f"Auto-selected: Option 1 (Yes)", GREEN)
 
     def process_output(self, data, write_func):
         """Process output data and check for prompts."""
+        self.write_func = write_func
+
         with self.lock:
             self.buffer += data
 
@@ -183,27 +209,25 @@ class OutputMonitor:
             if self.auto_accept and not self.in_plan_mode and time.time() > self.response_cooldown:
                 new_content = self.buffer[self.last_response_pos:]
 
-                if re.search(r'Do you want to proceed\?', new_content, re.IGNORECASE):
+                # Wait for full prompt: "Do you want to proceed?" AND "Esc to cancel" (indicates menu is ready)
+                has_proceed = re.search(r'Do you want to proceed\?', new_content, re.IGNORECASE)
+                has_menu_ready = re.search(r'(Esc to cancel|Yes.*No|1\.\s*Yes)', new_content, re.IGNORECASE)
+
+                if has_proceed and has_menu_ready:
                     # Determine best response
                     action = analyze_prompt_options(new_content)
 
-                    # Delay to let prompt fully render
-                    time.sleep(0.5)
-
-                    if action == "aggressive":
-                        # Send down arrow to move to option 2, then enter
-                        # Down arrow is ESC [ B or just sending "2" might work
-                        write_func(b"\x1b[B")  # Down arrow
-                        time.sleep(0.1)
-                        write_func(b"\r")      # Enter
-                        print_status(f"Auto-selected: Option 2 (don't ask again)", GREEN)
-                    else:
-                        # Just press enter for option 1
-                        write_func(b"\r")
-                        print_status(f"Auto-selected: Option 1 (Yes)", GREEN)
-
+                    # Mark as handled immediately to prevent duplicate responses
                     self.last_response_pos = len(self.buffer)
-                    self.response_cooldown = time.time() + 2  # 2 second cooldown
+                    self.response_cooldown = time.time() + 3  # 3 second cooldown
+
+                    # Send response in separate thread to not block output
+                    response_thread = threading.Thread(
+                        target=self._send_response_delayed,
+                        args=(action,),
+                        daemon=True
+                    )
+                    response_thread.start()
 
 
 def run_claude_unix(claude_path, claude_args, auto_accept=True):
