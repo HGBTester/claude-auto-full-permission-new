@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""
+claude-auto: A wrapper for claude CLI with auto-accept functionality.
+
+When AUTO_ACCEPT is enabled, automatically sends "1" to accept prompts.
+"""
+
+import argparse
+import os
+import sys
+import re
+import select
+import subprocess
+import pty
+import termios
+import tty
+import signal
+
+# ANSI color codes
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+RED = "\033[91m"
+CYAN = "\033[96m"
+RESET = "\033[0m"
+
+# Only trigger on this exact prompt
+ACCEPT_PATTERNS = [
+    r'Do you want to proceed\?',
+]
+
+def print_status(msg, color=CYAN):
+    """Print status message to stderr so it doesn't interfere with claude output."""
+    sys.stderr.write(f"{color}[claude-auto]{RESET} {msg}\n")
+    sys.stderr.flush()
+
+def should_auto_accept(data):
+    """Check if the output contains a prompt that should be auto-accepted."""
+    for pattern in ACCEPT_PATTERNS:
+        if re.search(pattern, data, re.IGNORECASE | re.MULTILINE):
+            return True
+    return False
+
+def run_claude_with_auto_accept(claude_args, auto_accept=True, auto_response="1"):
+    """Run claude command with optional auto-accept functionality."""
+
+    # Build the command
+    cmd = ["claude"] + claude_args
+
+    if auto_accept:
+        print_status(f"AUTO-ACCEPT: {GREEN}ON{RESET} (will press Enter automatically)", GREEN)
+    else:
+        print_status(f"AUTO-ACCEPT: {RED}OFF{RESET} (manual mode)", YELLOW)
+
+    print_status(f"Running: {' '.join(cmd)}")
+
+    # Create pseudo-terminal
+    master_fd, slave_fd = pty.openpty()
+
+    # Start the process
+    process = subprocess.Popen(
+        cmd,
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        close_fds=True
+    )
+
+    os.close(slave_fd)
+
+    # Save terminal settings
+    old_settings = None
+    if sys.stdin.isatty():
+        old_settings = termios.tcgetattr(sys.stdin)
+        tty.setraw(sys.stdin.fileno())
+
+    # Buffer to accumulate output for pattern matching
+    output_buffer = ""
+    last_auto_accept_pos = 0
+
+    try:
+        while True:
+            # Wait for input from either the process or stdin
+            rlist = [master_fd]
+            if sys.stdin.isatty():
+                rlist.append(sys.stdin)
+
+            try:
+                readable, _, _ = select.select(rlist, [], [], 0.1)
+            except select.error:
+                break
+
+            # Check if process is still running
+            if process.poll() is not None:
+                # Read any remaining output
+                try:
+                    remaining = os.read(master_fd, 4096)
+                    if remaining:
+                        sys.stdout.buffer.write(remaining)
+                        sys.stdout.buffer.flush()
+                except OSError:
+                    pass
+                break
+
+            # Handle output from claude
+            if master_fd in readable:
+                try:
+                    data = os.read(master_fd, 4096)
+                    if not data:
+                        break
+
+                    # Write to stdout
+                    sys.stdout.buffer.write(data)
+                    sys.stdout.buffer.flush()
+
+                    # Accumulate for pattern matching
+                    try:
+                        decoded = data.decode('utf-8', errors='replace')
+                        output_buffer += decoded
+
+                        # Keep buffer from growing too large
+                        if len(output_buffer) > 5000:
+                            output_buffer = output_buffer[-3000:]
+                            last_auto_accept_pos = max(0, last_auto_accept_pos - 2000)
+
+                        # Check for auto-accept patterns in new content
+                        if auto_accept:
+                            new_content = output_buffer[last_auto_accept_pos:]
+                            if should_auto_accept(new_content):
+                                # Delay to let the prompt fully render
+                                import time
+                                time.sleep(0.5)
+
+                                # Claude uses interactive menu - option 1 is already selected
+                                # Just send Enter (carriage return) to confirm
+                                os.write(master_fd, b"\r")
+                                print_status(f"Auto-accepted (pressed Enter)", GREEN)
+                                last_auto_accept_pos = len(output_buffer)
+                    except:
+                        pass
+
+                except OSError:
+                    break
+
+            # Handle input from user
+            if sys.stdin in readable:
+                try:
+                    user_input = os.read(sys.stdin.fileno(), 1024)
+                    if user_input:
+                        os.write(master_fd, user_input)
+                        # Reset auto-accept position when user types
+                        last_auto_accept_pos = len(output_buffer)
+                except OSError:
+                    break
+
+    except KeyboardInterrupt:
+        process.terminate()
+    finally:
+        # Restore terminal settings
+        if old_settings:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+        os.close(master_fd)
+
+    return process.returncode or 0
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="claude-auto: Claude CLI wrapper with auto-accept",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  claude-auto "fix the bug"           # Run with auto-accept ON (default)
+  claude-auto --no-auto "fix bug"     # Run with auto-accept OFF
+  claude-auto --response 2 "query"    # Auto-send "2" instead of "1"
+  claude-auto -- --help               # Pass --help to claude
+        """
+    )
+
+    parser.add_argument(
+        "--no-auto", "-n",
+        action="store_true",
+        help="Disable auto-accept (manual mode)"
+    )
+
+    parser.add_argument(
+        "--response", "-r",
+        default="1",
+        help="Response to send automatically (default: 1)"
+    )
+
+    parser.add_argument(
+        "claude_args",
+        nargs="*",
+        help="Arguments to pass to claude"
+    )
+
+    args = parser.parse_args()
+
+    auto_accept = not args.no_auto
+
+    exit_code = run_claude_with_auto_accept(
+        args.claude_args,
+        auto_accept=auto_accept,
+        auto_response=args.response
+    )
+
+    sys.exit(exit_code)
+
+if __name__ == "__main__":
+    main()
