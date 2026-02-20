@@ -1,27 +1,36 @@
 # claude-auto (Full Permission)
 
-A cross-platform wrapper for the Claude CLI that **natively bypasses all permission prompts**, including when running as **root**.
+A cross-platform wrapper for **Claude Code**, **Gemini CLI**, and **Codex CLI** that **natively bypasses all permission prompts**, including when running as **root**.
 
 ## Features
 
-- **Full permission bypass** - Uses Claude Code's native `--dangerously-skip-permissions` mechanism
-- **Root access support** - Sets `IS_SANDBOX=1` + `CLAUDE_CODE_BUBBLEWRAP=1` to unlock bypass even as root in containers
-- **3-layer bypass** - Environment variables + CLI flag + settings.json for maximum reliability
-- **Cross-platform** - Works on Linux, macOS, and Windows
-- **Auto-finds claude** - Searches PATH and common installation locations
-- **Manual override** - Disable bypass anytime with `-n` flag
+- **Multi-model support** — Claude Code, Gemini CLI, and Codex CLI from a single launcher
+- **Full permission bypass** — Each model's native bypass mechanism, applied automatically
+- **Interactive model menu** — Pick a model, run a session, pick another — no restart needed
+- **Root access support** — Sets `IS_SANDBOX=1` + `CLAUDE_CODE_BUBBLEWRAP=1` for Claude as root
+- **Cross-platform** — Works on Linux, macOS, and Windows
+- **Auto-detects CLIs** — Searches PATH and common installation locations
+- **Backward compatible** — Single-model installs behave exactly like before
 
-## How It Works
+## Bypass Mechanisms
 
-claude-auto uses a **3-layer approach** to ensure permissions are always bypassed:
-
-1. **Environment variables** - Sets `IS_SANDBOX=1` and `CLAUDE_CODE_BUBBLEWRAP=1` to unlock bypass for root users
-2. **CLI flag** - Passes `--dangerously-skip-permissions` to claude
-3. **Settings file** - Writes `~/.claude/settings.json` with `bypassPermissions` as default mode and all tools allowed
-
-This means **no permission prompts** ever interrupt your workflow - not for file edits, bash commands, web fetches, or any other tool.
+| Model | Bypass Flag | Env Vars | Config File |
+|-------|-------------|----------|-------------|
+| Claude | `--dangerously-skip-permissions` | `IS_SANDBOX=1`, `CLAUDE_CODE_BUBBLEWRAP=1` | `~/.claude/settings.json` |
+| Gemini | `--yolo` | None | None |
+| Codex | `--dangerously-bypass-approvals-and-sandbox` | None | None |
 
 ## Installation
+
+### Prerequisites
+
+Install one or more AI coding CLIs:
+
+```bash
+npm install -g @anthropic-ai/claude-code   # Claude Code
+npm install -g @google/gemini-cli           # Gemini CLI
+npm install -g @openai/codex                # Codex CLI
+```
 
 ### Linux / macOS
 
@@ -53,38 +62,80 @@ pip install colorama
 ## Usage
 
 ```bash
-# Full interactive session - all permissions bypassed (default)
+# Interactive model picker (when multiple CLIs installed)
 claude-auto
 
-# Interactive session with initial prompt
-claude-auto "fix the bug in main.py"
+# Launch a specific model directly
+claude-auto --model claude        # or -M claude
+claude-auto -M gemini
+claude-auto -M codex
 
-# One-shot prompt mode (non-interactive)
-claude-auto -p "fix the bug in main.py"
+# Show which models are installed
+claude-auto --list-models         # or -L
 
-# Disable bypass (normal claude behavior)
-claude-auto --no-bypass
-claude-auto -n
+# Exit after one session (don't loop back to menu)
+claude-auto --no-loop
 
-# Only write settings.json without launching claude
+# Disable bypass (run model CLI normally)
+claude-auto --no-bypass           # or -n
+claude-auto -n -M gemini          # Gemini without --yolo
+
+# Only write settings/environment, don't launch
 claude-auto --setup-only
 
-# Skip settings.json (only use env vars + CLI flag)
+# Skip writing settings.json (only env vars + CLI flag)
 claude-auto --no-settings
 
-# Pass flags directly to claude
-claude-auto -- --resume
-claude-auto -- --help
+# Pass flags through to the underlying CLI
+claude-auto -M claude -- --resume
+claude-auto -M gemini -- --help
 ```
 
 ## Options
 
 | Flag | Description |
 |------|-------------|
-| `--no-bypass`, `-n` | Disable permission bypass (run claude normally) |
-| `--setup-only` | Only write settings.json and environment, don't launch claude |
+| `--model`, `-M` (claude/gemini/codex) | Select model directly — skip menu, no loop |
+| `--list-models`, `-L` | Show installed models and exit |
+| `--no-loop` | Exit after session ends (don't show menu again) |
+| `--no-bypass`, `-n` | Disable permission bypass (run CLI normally) |
+| `--setup-only` | Only write settings/environment, don't launch |
 | `--no-settings` | Skip writing settings.json (only use env vars + CLI flag) |
 | `--help`, `-h` | Show help message |
+
+All unknown flags are passed through to the underlying CLI via `parse_known_args()`.
+
+**Note:** `-M` (uppercase) is used instead of `-m` to avoid conflicts with model-specific `-m` flags that pass through to the child CLI.
+
+## How It Works
+
+### Session Loop
+
+When multiple models are installed:
+
+```
+Start → Show menu → Pick model → Run session → Session ends → Show menu → Pick another or quit
+```
+
+When only one model is installed (backward compatible):
+
+```
+Start → Auto-detect model → Run session → Exit
+```
+
+### Claude Bypass (3-layer approach)
+
+1. **Environment variables** — Sets `IS_SANDBOX=1` and `CLAUDE_CODE_BUBBLEWRAP=1` to unlock bypass for root users
+2. **CLI flag** — Passes `--dangerously-skip-permissions` to claude
+3. **Settings file** — Writes `~/.claude/settings.json` with `bypassPermissions` as default mode and all tools allowed
+
+### Gemini Bypass
+
+Passes `--yolo` flag which disables all confirmation prompts.
+
+### Codex Bypass
+
+Passes `--dangerously-bypass-approvals-and-sandbox` flag which disables approval prompts and sandboxing.
 
 ## Root / Container Support
 
@@ -93,9 +144,9 @@ When running as root (common in Docker containers and CI/CD):
 - Claude Code normally **blocks** `--dangerously-skip-permissions` for root users
 - claude-auto sets `IS_SANDBOX=1` to signal a sandboxed environment, unlocking the bypass
 - `CLAUDE_CODE_BUBBLEWRAP=1` provides an additional sandbox signal
-- This makes it work seamlessly in Docker, CI/CD pipelines, and automated environments
+- Gemini and Codex bypass flags work without special root handling
 
-## Settings.json Configuration
+## Settings.json Configuration (Claude only)
 
 claude-auto writes the following to `~/.claude/settings.json`:
 
@@ -112,33 +163,10 @@ claude-auto writes the following to `~/.claude/settings.json`:
 }
 ```
 
-## Claude Detection
-
-claude-auto searches for the claude executable in:
-
-**Linux/macOS:**
-- PATH
-- `/usr/local/bin/claude`
-- `/usr/bin/claude`
-- `~/.local/bin/claude`
-- `~/.npm-global/bin/claude`
-- `/opt/claude/claude`
-- `~/.claude/claude`
-- npm global bin directory
-
-**Windows:**
-- PATH
-- `%LOCALAPPDATA%\Programs\claude\claude.exe`
-- `%APPDATA%\npm\claude.cmd`
-- `~\.claude\claude.exe`
-- `C:\Program Files\claude\claude.exe`
-- `C:\Program Files (x86)\claude\claude.exe`
-- npm global bin directory
-
 ## Requirements
 
 - Python 3.6+
-- `claude` CLI installed
+- At least one supported CLI installed (`claude`, `gemini`, or `codex`)
 - (Windows optional) `colorama` for colored output
 
 ## License

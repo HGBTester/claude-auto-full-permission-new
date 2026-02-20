@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-claude-auto: Cross-platform wrapper for Claude CLI that bypasses all permission prompts.
+claude-auto: Cross-platform wrapper for Claude, Gemini, and Codex CLIs
+that bypasses all permission prompts.
 
-Uses Claude Code's native bypass mechanism instead of fragile keystroke simulation.
-Works as root in containers by setting IS_SANDBOX=1 to unlock --dangerously-skip-permissions.
+Supports all three AI coding CLIs with full permission bypass:
+  - Claude Code  (--dangerously-skip-permissions)
+  - Gemini CLI   (--yolo)
+  - Codex CLI    (--dangerously-bypass-approvals-and-sandbox)
 
-Supports both full interactive sessions and one-shot (-p) prompts.
+Features an interactive model selection menu and session loop.
 """
 
 import argparse
@@ -27,15 +30,101 @@ if IS_WINDOWS:
         YELLOW = "\033[93m"
         RED = "\033[91m"
         CYAN = "\033[96m"
+        BOLD = "\033[1m"
         RESET = "\033[0m"
     except ImportError:
-        GREEN = YELLOW = RED = CYAN = RESET = ""
+        GREEN = YELLOW = RED = CYAN = BOLD = RESET = ""
 else:
     GREEN = "\033[92m"
     YELLOW = "\033[93m"
     RED = "\033[91m"
     CYAN = "\033[96m"
+    BOLD = "\033[1m"
     RESET = "\033[0m"
+
+# ---------------------------------------------------------------------------
+# Model definitions — all model-specific logic is driven from this dict
+# ---------------------------------------------------------------------------
+MODELS = {
+    "claude": {
+        "display_name": "Claude Code",
+        "executables": ["claude.exe", "claude"] if IS_WINDOWS else ["claude"],
+        "search_paths_unix": [
+            "/usr/local/bin/claude",
+            "/usr/bin/claude",
+            "~/.local/bin/claude",
+            "~/.npm-global/bin/claude",
+            "/opt/claude/claude",
+            "~/.claude/claude",
+        ],
+        "search_paths_windows": [
+            r"%LOCALAPPDATA%\Programs\claude\claude.exe",
+            r"%APPDATA%\npm\claude.cmd",
+            r"%APPDATA%\npm\claude",
+            r"~\.claude\claude.exe",
+            r"C:\Program Files\claude\claude.exe",
+            r"C:\Program Files (x86)\claude\claude.exe",
+        ],
+        "bypass_flag": "--dangerously-skip-permissions",
+        "env_vars": {"IS_SANDBOX": "1", "CLAUDE_CODE_BUBBLEWRAP": "1"},
+        "settings": {
+            "config_dir_env": "CLAUDE_CONFIG_DIR",
+            "config_dir_default": "~/.claude",
+            "filename": "settings.json",
+            "content": {
+                "permissions": {
+                    "defaultMode": "bypassPermissions",
+                    "allow": [
+                        "Bash(*)", "Edit", "Write", "Read", "Glob", "Grep",
+                        "WebFetch(*)", "WebSearch(*)", "NotebookEdit",
+                        "Task(*)", "Skill(*)",
+                    ],
+                },
+                "skipDangerousModePermissionPrompt": True,
+            },
+        },
+        "prompt_flag": "-p",
+        "npm_package": "@anthropic-ai/claude-code",
+    },
+    "gemini": {
+        "display_name": "Gemini CLI",
+        "executables": ["gemini.exe", "gemini"] if IS_WINDOWS else ["gemini"],
+        "search_paths_unix": [
+            "/usr/local/bin/gemini",
+            "/usr/bin/gemini",
+            "~/.local/bin/gemini",
+            "~/.npm-global/bin/gemini",
+        ],
+        "search_paths_windows": [
+            r"%APPDATA%\npm\gemini.cmd",
+            r"%APPDATA%\npm\gemini",
+        ],
+        "bypass_flag": "--yolo",
+        "env_vars": {},
+        "settings": None,
+        "prompt_flag": None,
+        "npm_package": "@google/gemini-cli",
+    },
+    "codex": {
+        "display_name": "Codex CLI",
+        "executables": ["codex.exe", "codex"] if IS_WINDOWS else ["codex"],
+        "search_paths_unix": [
+            "/usr/local/bin/codex",
+            "/usr/bin/codex",
+            "~/.local/bin/codex",
+            "~/.npm-global/bin/codex",
+        ],
+        "search_paths_windows": [
+            r"%APPDATA%\npm\codex.cmd",
+            r"%APPDATA%\npm\codex",
+        ],
+        "bypass_flag": "--dangerously-bypass-approvals-and-sandbox",
+        "env_vars": {},
+        "settings": None,
+        "prompt_flag": "-p",
+        "npm_package": "@openai/codex",
+    },
+}
 
 
 def print_status(msg, color=CYAN):
@@ -43,48 +132,56 @@ def print_status(msg, color=CYAN):
     sys.stderr.flush()
 
 
-def find_claude():
-    """Find claude executable in the system."""
-    names = ["claude", "claude.exe"] if IS_WINDOWS else ["claude"]
+# ---------------------------------------------------------------------------
+# Generic functions (replace old Claude-specific ones)
+# ---------------------------------------------------------------------------
 
-    for name in names:
+def find_executable(model_key):
+    """Find the executable for a given model."""
+    model = MODELS[model_key]
+
+    # 1) Check PATH via shutil.which
+    for name in model["executables"]:
         path = shutil.which(name)
         if path:
             return path
 
+    # 2) Check common installation paths
     if IS_WINDOWS:
-        common_paths = [
-            os.path.expandvars(r"%LOCALAPPDATA%\Programs\claude\claude.exe"),
-            os.path.expandvars(r"%APPDATA%\npm\claude.cmd"),
-            os.path.expandvars(r"%APPDATA%\npm\claude"),
-            os.path.expanduser(r"~\.claude\claude.exe"),
-            r"C:\Program Files\claude\claude.exe",
-            r"C:\Program Files (x86)\claude\claude.exe",
-        ]
+        search_paths = model.get("search_paths_windows", [])
     else:
-        common_paths = [
-            "/usr/local/bin/claude",
-            "/usr/bin/claude",
-            os.path.expanduser("~/.local/bin/claude"),
-            os.path.expanduser("~/.npm-global/bin/claude"),
-            "/opt/claude/claude",
-            os.path.expanduser("~/.claude/claude"),
-        ]
+        search_paths = model.get("search_paths_unix", [])
 
-    for path in common_paths:
-        if os.path.isfile(path) and os.access(path, os.X_OK):
-            return path
+    for p in search_paths:
+        expanded = os.path.expandvars(os.path.expanduser(p))
+        if os.path.isfile(expanded) and os.access(expanded, os.X_OK):
+            return expanded
 
+    # 3) Try npm global bin
     try:
-        result = subprocess.run(["npm", "root", "-g"], capture_output=True, text=True)
+        result = subprocess.run(
+            ["npm", "root", "-g"], capture_output=True, text=True
+        )
         if result.returncode == 0:
-            npm_path = os.path.join(result.stdout.strip(), ".bin", "claude")
+            # The executable name is the first entry without .exe
+            exe_name = model["executables"][-1]  # e.g. "claude", "gemini", "codex"
+            npm_path = os.path.join(result.stdout.strip(), ".bin", exe_name)
             if os.path.isfile(npm_path):
                 return npm_path
     except Exception:
         pass
 
     return None
+
+
+def detect_installed_models():
+    """Return dict of {model_key: executable_path} for all found models."""
+    found = {}
+    for key in MODELS:
+        path = find_executable(key)
+        if path:
+            found[key] = path
+    return found
 
 
 def is_root():
@@ -98,15 +195,37 @@ def is_root():
     return os.getuid() == 0
 
 
-def setup_settings():
-    """Write ~/.claude/settings.json with bypass permissions as default mode.
+def setup_environment(model_key):
+    """Set environment variables needed for bypass (model-specific)."""
+    model = MODELS[model_key]
+    env_vars = model.get("env_vars", {})
+    if not env_vars:
+        return
 
-    This is a belt-and-suspenders approach: even if the CLI flag fails,
-    the settings file ensures bypass mode is the default.
-    """
-    config_dir = os.environ.get("CLAUDE_CONFIG_DIR", os.path.expanduser("~/.claude"))
-    settings_path = os.path.join(config_dir, "settings.json")
+    env_set = []
+    for var, val in env_vars.items():
+        if os.environ.get(var) != val:
+            os.environ[var] = val
+            env_set.append(f"{var}={val}")
 
+    if env_set:
+        print_status(f"Environment: {', '.join(env_set)}", GREEN)
+
+
+def setup_settings(model_key):
+    """Write config file with bypass permissions if the model needs it."""
+    model = MODELS[model_key]
+    settings_spec = model.get("settings")
+    if not settings_spec:
+        return
+
+    config_dir = os.environ.get(
+        settings_spec["config_dir_env"],
+        os.path.expanduser(settings_spec["config_dir_default"]),
+    )
+    settings_path = os.path.join(config_dir, settings_spec["filename"])
+
+    # Read existing
     settings = {}
     if os.path.isfile(settings_path):
         try:
@@ -115,27 +234,22 @@ def setup_settings():
         except (json.JSONDecodeError, IOError):
             pass
 
+    desired = settings_spec["content"]
     changed = False
 
-    # Set permissions.defaultMode to bypassPermissions
-    if "permissions" not in settings:
-        settings["permissions"] = {}
-    if settings["permissions"].get("defaultMode") != "bypassPermissions":
-        settings["permissions"]["defaultMode"] = "bypassPermissions"
-        changed = True
-
-    # Allow all tool patterns
-    desired_allow = ["Bash(*)", "Edit", "Write", "Read", "Glob", "Grep",
-                     "WebFetch(*)", "WebSearch(*)", "NotebookEdit", "Task(*)",
-                     "Skill(*)"]
-    if settings["permissions"].get("allow") != desired_allow:
-        settings["permissions"]["allow"] = desired_allow
-        changed = True
-
-    # Skip the "are you sure?" trust dialog
-    if settings.get("skipDangerousModePermissionPrompt") is not True:
-        settings["skipDangerousModePermissionPrompt"] = True
-        changed = True
+    # Deep-merge top-level keys from desired into settings
+    for key, value in desired.items():
+        if isinstance(value, dict):
+            if key not in settings:
+                settings[key] = {}
+            for subkey, subval in value.items():
+                if settings[key].get(subkey) != subval:
+                    settings[key][subkey] = subval
+                    changed = True
+        else:
+            if settings.get(key) != value:
+                settings[key] = value
+                changed = True
 
     if changed:
         os.makedirs(config_dir, exist_ok=True)
@@ -146,120 +260,229 @@ def setup_settings():
         print_status(f"Settings OK: {settings_path}", GREEN)
 
 
-def setup_environment():
-    """Set environment variables needed for bypass as root."""
-    env_set = []
+def build_cmd(model_key, exe_path, extra_args, bypass=True):
+    """Build the full command to launch a model CLI."""
+    model = MODELS[model_key]
+    cmd = [exe_path]
 
-    # IS_SANDBOX=1 unlocks --dangerously-skip-permissions for root
-    if os.environ.get("IS_SANDBOX") != "1":
-        os.environ["IS_SANDBOX"] = "1"
-        env_set.append("IS_SANDBOX=1")
+    if bypass and model["bypass_flag"]:
+        if model["bypass_flag"] not in extra_args:
+            cmd.append(model["bypass_flag"])
 
-    # CLAUDE_CODE_BUBBLEWRAP=1 is the secondary check
-    if os.environ.get("CLAUDE_CODE_BUBBLEWRAP") != "1":
-        os.environ["CLAUDE_CODE_BUBBLEWRAP"] = "1"
-        env_set.append("CLAUDE_CODE_BUBBLEWRAP=1")
-
-    if env_set:
-        print_status(f"Environment: {', '.join(env_set)}", GREEN)
-
-
-def build_claude_cmd(claude_path, claude_args, bypass=True):
-    """Build the full command to launch claude."""
-    cmd = [claude_path]
-
-    if bypass:
-        # Only add if not already in user args
-        if "--dangerously-skip-permissions" not in claude_args:
-            cmd.append("--dangerously-skip-permissions")
-
-    cmd.extend(claude_args)
+    cmd.extend(extra_args)
     return cmd
 
 
+# ---------------------------------------------------------------------------
+# Interactive model selection menu
+# ---------------------------------------------------------------------------
+
+def show_model_menu(installed):
+    """Show interactive model picker. Returns chosen model_key or None to quit."""
+    keys = list(installed.keys())
+
+    print(f"\n{BOLD}{'=' * 50}{RESET}")
+    print(f"{BOLD}  claude-auto — AI Coding CLI Launcher{RESET}")
+    print(f"{BOLD}{'=' * 50}{RESET}")
+    print(f"\n  Available models:\n")
+
+    for i, key in enumerate(keys, 1):
+        model = MODELS[key]
+        print(f"    {BOLD}{i}{RESET}) {model['display_name']:<15} ({key})")
+
+    print(f"\n    {BOLD}q{RESET}) Quit")
+    print()
+
+    while True:
+        try:
+            choice = input(f"  Select model [1-{len(keys)}/q]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+
+        if choice in ("q", "quit", "exit"):
+            return None
+
+        # Accept number
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(keys):
+                return keys[idx]
+
+        # Accept model name
+        if choice in installed:
+            return choice
+
+        print(f"  {RED}Invalid choice. Try again.{RESET}")
+
+
+def list_models():
+    """Print all models and their install status, then exit."""
+    print(f"\n{BOLD}Supported models:{RESET}\n")
+    for key, model in MODELS.items():
+        path = find_executable(key)
+        if path:
+            status = f"{GREEN}FOUND{RESET}  {path}"
+        else:
+            status = f"{RED}NOT FOUND{RESET}"
+        print(f"  {model['display_name']:<15} ({key:<7})  {status}")
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main():
     parser = argparse.ArgumentParser(
-        description="claude-auto: Claude CLI wrapper with native permission bypass",
+        description="claude-auto: Multi-model AI CLI wrapper with permission bypass",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  claude-auto                          # Full interactive session, all permissions bypassed
-  claude-auto "fix the bug"            # Interactive session with initial prompt
-  claude-auto -p "fix the bug"         # One-shot prompt mode (non-interactive)
-  claude-auto --no-bypass "fix bug"    # Disable bypass (fall back to normal claude)
-  claude-auto --setup-only             # Just write settings, don't launch claude
-  claude-auto -- --resume              # Pass flags directly to claude
+  claude-auto                          # Interactive model picker (if multiple installed)
+  claude-auto --model claude           # Launch Claude with bypass, exit when done
+  claude-auto -M gemini                # Launch Gemini with --yolo
+  claude-auto -M codex                 # Launch Codex with bypass
+  claude-auto --list-models            # Show installed models
+  claude-auto --no-bypass -M gemini    # Launch Gemini without --yolo
+  claude-auto --no-loop                # Exit after first session (no menu loop)
+  claude-auto --setup-only             # Just write settings, don't launch
 
-Bypass method:
-  1. Sets IS_SANDBOX=1 + CLAUDE_CODE_BUBBLEWRAP=1 (unlocks bypass for root)
-  2. Passes --dangerously-skip-permissions to claude
-  3. Writes ~/.claude/settings.json with bypassPermissions as default mode
-        """
+Bypass mechanisms:
+  Claude:  IS_SANDBOX=1, CLAUDE_CODE_BUBBLEWRAP=1, --dangerously-skip-permissions, settings.json
+  Gemini:  --yolo
+  Codex:   --dangerously-bypass-approvals-and-sandbox
+        """,
+    )
+
+    parser.add_argument(
+        "--model", "-M",
+        choices=list(MODELS.keys()),
+        help="Select model directly (claude, gemini, codex) — skip menu, no loop",
+    )
+
+    parser.add_argument(
+        "--list-models", "-L",
+        action="store_true",
+        help="Show installed models and exit",
+    )
+
+    parser.add_argument(
+        "--no-loop",
+        action="store_true",
+        help="Exit after session ends (don't show model menu again)",
     )
 
     parser.add_argument(
         "--no-bypass", "-n",
         action="store_true",
-        help="Disable permission bypass (run claude normally)"
+        help="Disable permission bypass (run model CLI normally)",
     )
 
     parser.add_argument(
         "--setup-only",
         action="store_true",
-        help="Only write settings.json and environment, don't launch claude"
+        help="Only write settings/environment, don't launch any CLI",
     )
 
     parser.add_argument(
         "--no-settings",
         action="store_true",
-        help="Skip writing settings.json (only use env vars + CLI flag)"
+        help="Skip writing settings.json (only use env vars + CLI flag)",
     )
 
-    # Use parse_known_args so unknown flags pass through to claude
-    args, claude_args = parser.parse_known_args()
+    args, passthrough_args = parser.parse_known_args()
     bypass = not args.no_bypass
 
-    # Find claude
-    claude_path = find_claude()
-    if not claude_path:
-        print_status("ERROR: Could not find 'claude' executable!", RED)
-        print_status("Make sure claude CLI is installed and in your PATH", YELLOW)
+    # --list-models: show and exit
+    if args.list_models:
+        list_models()
+        sys.exit(0)
+
+    # Detect installed models
+    installed = detect_installed_models()
+
+    if not installed:
+        print_status("ERROR: No supported CLI found (claude, gemini, codex)!", RED)
+        print_status("Install at least one:", YELLOW)
+        for key, model in MODELS.items():
+            print_status(f"  npm install -g {model['npm_package']}", YELLOW)
         sys.exit(1)
 
-    print_status(f"Found claude: {claude_path}")
-
-    if bypass:
-        print_status(f"BYPASS MODE: {GREEN}ON{RESET} (native --dangerously-skip-permissions)", GREEN)
-
-        if is_root():
-            print_status(f"Running as root - setting sandbox env vars", YELLOW)
-
-        setup_environment()
-
-        if not args.no_settings:
-            setup_settings()
-    else:
-        print_status(f"BYPASS MODE: {RED}OFF{RESET} (normal claude)", YELLOW)
-
+    # --setup-only: configure all installed models and exit
     if args.setup_only:
+        for key in installed:
+            print_status(f"Setting up {MODELS[key]['display_name']}...", CYAN)
+            if bypass:
+                setup_environment(key)
+                if not args.no_settings:
+                    setup_settings(key)
         print_status("Setup complete. Run 'claude-auto' to launch.", GREEN)
         sys.exit(0)
 
-    # Build command
-    cmd = build_claude_cmd(claude_path, claude_args, bypass)
+    # Determine if we loop or run once
+    # --model flag: run that model once, no loop
+    # only one model installed: run it once (backward compat), no loop
+    # multiple models, no --model: show menu + loop
+    if args.model:
+        if args.model not in installed:
+            print_status(
+                f"ERROR: {MODELS[args.model]['display_name']} not found!", RED
+            )
+            print_status("Run 'claude-auto --list-models' to see installed models", YELLOW)
+            sys.exit(1)
+        run_session(args.model, installed[args.model], passthrough_args, bypass, args.no_settings)
+        sys.exit(0)
+
+    if len(installed) == 1:
+        # Single model — backward compatible behavior
+        key = next(iter(installed))
+        run_session(key, installed[key], passthrough_args, bypass, args.no_settings)
+        sys.exit(0)
+
+    # Multiple models — interactive menu loop
+    while True:
+        model_key = show_model_menu(installed)
+        if model_key is None:
+            print_status("Goodbye!", GREEN)
+            break
+
+        run_session(model_key, installed[model_key], passthrough_args, bypass, args.no_settings)
+
+        if args.no_loop:
+            break
+
+        print_status("Session ended. Returning to model menu...\n", CYAN)
+
+
+def run_session(model_key, exe_path, extra_args, bypass, no_settings):
+    """Set up and run a single CLI session."""
+    model = MODELS[model_key]
+    print_status(f"Model: {BOLD}{model['display_name']}{RESET} ({exe_path})")
+
+    if bypass:
+        print_status(
+            f"BYPASS MODE: {GREEN}ON{RESET} ({model['bypass_flag']})", GREEN
+        )
+
+        if is_root() and model["env_vars"]:
+            print_status("Running as root — setting sandbox env vars", YELLOW)
+
+        setup_environment(model_key)
+
+        if not no_settings:
+            setup_settings(model_key)
+    else:
+        print_status(f"BYPASS MODE: {RED}OFF{RESET} (normal {model_key})", YELLOW)
+
+    cmd = build_cmd(model_key, exe_path, extra_args, bypass)
     print_status(f"Launching: {' '.join(cmd)}")
 
-    # Replace this process with claude (full interactive session)
-    # os.execvpe gives claude direct access to the terminal - no PTY wrapper needed
-    if IS_WINDOWS:
-        # Windows doesn't support exec, use subprocess
-        try:
-            result = subprocess.run(cmd)
-            sys.exit(result.returncode or 0)
-        except KeyboardInterrupt:
-            sys.exit(130)
-    else:
-        os.execvpe(cmd[0], cmd, os.environ)
+    try:
+        result = subprocess.run(cmd)
+        return result.returncode or 0
+    except KeyboardInterrupt:
+        return 130
 
 
 if __name__ == "__main__":
