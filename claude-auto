@@ -143,6 +143,52 @@ MODELS = {
         "context_inject": "positional",
         "npm_package": "@anthropic-ai/claude-code",
     },
+    "forked-claude": {
+        "display_name": "Forked Claude",
+        "executables": ["claude.exe", "claude"] if IS_WINDOWS else ["claude"],
+        "search_paths_unix": [
+            "/usr/local/bin/claude",
+            "/usr/bin/claude",
+            "~/.local/bin/claude",
+            "~/.npm-global/bin/claude",
+            "/opt/claude/claude",
+            "~/.claude/claude",
+        ],
+        "search_paths_windows": [
+            r"%LOCALAPPDATA%\Programs\claude\claude.exe",
+            r"%APPDATA%\npm\claude.cmd",
+            r"%APPDATA%\npm\claude",
+            r"~\.claude\claude.exe",
+            r"C:\Program Files\claude\claude.exe",
+            r"C:\Program Files (x86)\claude\claude.exe",
+        ],
+        "bypass_flag": "--dangerously-skip-permissions",
+        "env_vars": {
+            "IS_SANDBOX": "1",
+            "CLAUDE_CODE_BUBBLEWRAP": "1",
+            "CLAUDE_CODE_SANDBOX_MODE": "1",
+        },
+        "settings": {
+            "config_dir_env": "CLAUDE_CONFIG_DIR",
+            "config_dir_default": "~/.claude",
+            "filename": "settings.json",
+            "content": {
+                "permissions": {
+                    "defaultMode": "bypassPermissions",
+                    "allow": [
+                        "Bash(*)", "Edit", "Write", "Read", "Glob", "Grep",
+                        "WebFetch(*)", "WebSearch(*)", "NotebookEdit",
+                        "Task(*)", "Skill(*)", "EnterPlanMode",
+                        "EnterWorktree", "AskUserQuestion",
+                    ],
+                },
+                "skipDangerousModePermissionPrompt": True,
+            },
+        },
+        "prompt_flag": "-p",
+        "context_inject": "positional",
+        "npm_package": "@anthropic-ai/claude-code",
+    },
     "gemini": {
         "display_name": "Gemini CLI",
         "executables": ["gemini.exe", "gemini"] if IS_WINDOWS else ["gemini"],
