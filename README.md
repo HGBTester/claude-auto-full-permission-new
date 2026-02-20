@@ -7,8 +7,11 @@ A cross-platform wrapper for **Claude Code**, **Gemini CLI**, and **Codex CLI** 
 - **Multi-model support** — Claude Code, Gemini CLI, and Codex CLI from a single launcher
 - **Full permission bypass** — Each model's native bypass mechanism, applied automatically
 - **Interactive model menu** — Pick a model, run a session, pick another — no restart needed
+- **Session capture** — Captures terminal output via PTY for session logging and context handoff
+- **Cross-model context handoff** — Switch models mid-workflow and carry the conversation context
+- **Session logging** — Saves cleaned session transcripts to `~/.claude-auto/logs/`
 - **Root access support** — Sets `IS_SANDBOX=1` + `CLAUDE_CODE_BUBBLEWRAP=1` for Claude as root
-- **Cross-platform** — Works on Linux, macOS, and Windows
+- **Cross-platform** — Works on Linux, macOS, and Windows (capture features are Unix-only)
 - **Auto-detects CLIs** — Searches PATH and common installation locations
 - **Backward compatible** — Single-model installs behave exactly like before
 
@@ -86,6 +89,15 @@ claude-auto --setup-only
 # Skip writing settings.json (only env vars + CLI flag)
 claude-auto --no-settings
 
+# Disable PTY capture (plain subprocess, no context handoff)
+claude-auto --no-capture
+
+# Disable context handoff between sessions (still saves logs)
+claude-auto --no-context
+
+# Custom session log directory
+claude-auto --log-dir /tmp/my-logs
+
 # Pass flags through to the underlying CLI
 claude-auto -M claude -- --resume
 claude-auto -M gemini -- --help
@@ -101,6 +113,9 @@ claude-auto -M gemini -- --help
 | `--no-bypass`, `-n` | Disable permission bypass (run CLI normally) |
 | `--setup-only` | Only write settings/environment, don't launch |
 | `--no-settings` | Skip writing settings.json (only use env vars + CLI flag) |
+| `--no-capture` | Disable PTY capture (plain subprocess, no context handoff) |
+| `--no-context` | Disable context handoff between sessions (still saves logs) |
+| `--log-dir DIR` | Custom directory for session logs (default: `~/.claude-auto/logs`) |
 | `--help`, `-h` | Show help message |
 
 All unknown flags are passed through to the underlying CLI via `parse_known_args()`.
@@ -109,12 +124,14 @@ All unknown flags are passed through to the underlying CLI via `parse_known_args
 
 ## How It Works
 
-### Session Loop
+### Session Loop with Context Handoff
 
 When multiple models are installed:
 
 ```
-Start → Show menu → Pick model → Run session → Session ends → Show menu → Pick another or quit
+Start → Show menu → Pick model → Run session (PTY capture) → Session ends
+  → Post-session menu → Pick next model → "Carry context? [Y/n]"
+  → Inject transcript as initial prompt → Run next session → ...
 ```
 
 When only one model is installed (backward compatible):
@@ -122,6 +139,22 @@ When only one model is installed (backward compatible):
 ```
 Start → Auto-detect model → Run session → Exit
 ```
+
+### Context Handoff
+
+When you exit a session and pick another model, claude-auto offers to carry the conversation context:
+
+1. **PTY Capture** — Terminal output is captured via `pty.fork()` while still displaying normally
+2. **ANSI Stripping** — Raw terminal bytes are cleaned of escape sequences and control characters
+3. **Context Accumulation** — Each session's transcript is appended with session markers
+4. **Handoff Injection** — The accumulated transcript is wrapped in a handoff prompt template and passed to the next CLI as a positional argument (Claude, Codex) or `-i` flag (Gemini)
+5. **Truncation** — Context is tail-truncated to 50,000 characters, breaking at session boundaries when possible
+
+Session transcripts are also saved to `~/.claude-auto/logs/` as `YYYYMMDD_HHMMSS_sNN_model.log`.
+
+### Windows Graceful Degradation
+
+PTY capture requires Unix APIs (`pty`, `termios`, `tty`). On Windows, sessions run via plain `subprocess.run()` — identical to previous behavior, with no capture or context handoff.
 
 ### Claude Bypass (3-layer approach)
 

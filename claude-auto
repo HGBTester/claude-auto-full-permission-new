@@ -14,12 +14,18 @@ Features an interactive model selection menu and session loop.
 import argparse
 import json
 import os
+import re
 import sys
 import shutil
 import subprocess
 import platform
+import errno
+from datetime import datetime
 
 IS_WINDOWS = platform.system() == "Windows"
+
+if not IS_WINDOWS:
+    import pty, tty, termios, select, signal, struct, fcntl
 
 # ANSI colors
 if IS_WINDOWS:
@@ -41,6 +47,33 @@ else:
     CYAN = "\033[96m"
     BOLD = "\033[1m"
     RESET = "\033[0m"
+
+# ---------------------------------------------------------------------------
+# Session capture & context handoff constants
+# ---------------------------------------------------------------------------
+MAX_CONTEXT_CHARS = 50000
+LOG_DIR = os.path.expanduser("~/.claude-auto/logs")
+
+HANDOFF_TEMPLATE = """\
+You are continuing a multi-model coding session. Below is the transcript of the \
+previous session(s). Read it carefully and continue where it left off. Do NOT \
+repeat work that was already completed.
+
+<previous_session_transcript>
+{transcript}
+</previous_session_transcript>
+
+Continue the task above. If the previous session ended mid-task, pick up from \
+where it stopped. If it completed, ask the user what to do next."""
+
+_ANSI_RE = re.compile(
+    r"(\x1b\[[0-9;]*[A-Za-z]"       # CSI sequences
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC sequences
+    r"|\x1b[()][0-9A-B]"            # charset selection
+    r"|\x1b[=><%]"                   # misc mode escapes
+    r"|\x1b\[[\?]?[0-9;]*[hlsr]"    # mode set/reset
+    r")"
+)
 
 # ---------------------------------------------------------------------------
 # Model definitions — all model-specific logic is driven from this dict
@@ -84,6 +117,7 @@ MODELS = {
             },
         },
         "prompt_flag": "-p",
+        "context_inject": "positional",
         "npm_package": "@anthropic-ai/claude-code",
     },
     "gemini": {
@@ -103,6 +137,7 @@ MODELS = {
         "env_vars": {},
         "settings": None,
         "prompt_flag": None,
+        "context_inject": "flag_interactive",
         "npm_package": "@google/gemini-cli",
     },
     "codex": {
@@ -122,6 +157,7 @@ MODELS = {
         "env_vars": {},
         "settings": None,
         "prompt_flag": "-p",
+        "context_inject": "positional",
         "npm_package": "@openai/codex",
     },
 }
@@ -260,7 +296,7 @@ def setup_settings(model_key):
         print_status(f"Settings OK: {settings_path}", GREEN)
 
 
-def build_cmd(model_key, exe_path, extra_args, bypass=True):
+def build_cmd(model_key, exe_path, extra_args, bypass=True, context_prompt=None):
     """Build the full command to launch a model CLI."""
     model = MODELS[model_key]
     cmd = [exe_path]
@@ -270,7 +306,175 @@ def build_cmd(model_key, exe_path, extra_args, bypass=True):
             cmd.append(model["bypass_flag"])
 
     cmd.extend(extra_args)
+
+    if context_prompt:
+        mode = model.get("context_inject", "positional")
+        if mode == "flag_interactive":
+            cmd.extend(["-i", context_prompt])
+        else:  # positional
+            cmd.append(context_prompt)
+
     return cmd
+
+
+# ---------------------------------------------------------------------------
+# PTY session capture (Unix only)
+# ---------------------------------------------------------------------------
+
+def run_session_pty(cmd):
+    """Run cmd under a PTY, proxying I/O and capturing child output.
+
+    Returns (exit_code, captured_bytes).
+    """
+    captured = bytearray()
+
+    pid, master_fd = pty.fork()
+    if pid == 0:
+        # Child — exec the command
+        os.execvp(cmd[0], cmd)
+        # unreachable unless exec fails
+        os._exit(127)
+
+    # Parent — proxy stdin↔master_fd, tee output
+    old_attrs = termios.tcgetattr(sys.stdin.fileno())
+
+    def _sigwinch(signum, frame):
+        """Forward terminal resize to child PTY."""
+        try:
+            rows, cols = os.get_terminal_size()
+            winsize = struct.pack("HHHH", rows, cols, 0, 0)
+            fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize)
+            os.kill(pid, signal.SIGWINCH)
+        except (OSError, ValueError):
+            pass
+
+    prev_handler = signal.signal(signal.SIGWINCH, _sigwinch)
+
+    # Send initial size
+    try:
+        rows, cols = os.get_terminal_size()
+        winsize = struct.pack("HHHH", rows, cols, 0, 0)
+        fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize)
+    except (OSError, ValueError):
+        pass
+
+    try:
+        tty.setraw(sys.stdin.fileno())
+
+        while True:
+            try:
+                ready, _, _ = select.select([sys.stdin, master_fd], [], [], 0.1)
+            except (select.error, OSError) as e:
+                if getattr(e, "errno", None) == errno.EINTR or (
+                    isinstance(e, OSError) and e.errno == errno.EINTR
+                ):
+                    continue
+                raise
+
+            if master_fd in ready:
+                try:
+                    data = os.read(master_fd, 4096)
+                except OSError:
+                    break
+                if not data:
+                    break
+                captured.extend(data)
+                os.write(sys.stdout.fileno(), data)
+
+            if sys.stdin in ready:
+                try:
+                    data = os.read(sys.stdin.fileno(), 4096)
+                except OSError:
+                    break
+                if not data:
+                    break
+                os.write(master_fd, data)
+    finally:
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_attrs)
+        signal.signal(signal.SIGWINCH, prev_handler)
+
+    # Drain remaining output
+    while True:
+        try:
+            ready, _, _ = select.select([master_fd], [], [], 0.05)
+            if not ready:
+                break
+            data = os.read(master_fd, 4096)
+            if not data:
+                break
+            captured.extend(data)
+        except OSError:
+            break
+
+    try:
+        os.close(master_fd)
+    except OSError:
+        pass
+
+    _, status = os.waitpid(pid, 0)
+    exit_code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1
+
+    return exit_code, bytes(captured)
+
+
+# ---------------------------------------------------------------------------
+# ANSI stripping & context management
+# ---------------------------------------------------------------------------
+
+def strip_ansi(raw_bytes):
+    """Convert captured PTY bytes to clean text."""
+    try:
+        text = raw_bytes.decode("utf-8", errors="replace")
+    except Exception:
+        text = raw_bytes.decode("latin-1", errors="replace")
+    text = _ANSI_RE.sub("", text)
+    # Remove remaining control chars but keep \n and \t
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+    text = text.replace("\r", "")
+    # Collapse runs of 3+ blank lines to 2
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def truncate_context(text, max_chars=MAX_CONTEXT_CHARS):
+    """Tail-truncate text to max_chars, breaking at a session boundary if possible."""
+    if len(text) <= max_chars:
+        return text
+    truncated = text[-max_chars:]
+    # Try to break at a session boundary marker
+    marker = truncated.find("\n--- Session ")
+    if marker != -1 and marker < len(truncated) // 2:
+        truncated = truncated[marker + 1:]
+    else:
+        # Break at first newline
+        nl = truncated.find("\n")
+        if nl != -1 and nl < 200:
+            truncated = truncated[nl + 1:]
+    return "[...truncated...]\n" + truncated
+
+
+def format_handoff_prompt(accumulated_context):
+    """Wrap accumulated transcript in the handoff template."""
+    trimmed = truncate_context(accumulated_context)
+    return HANDOFF_TEMPLATE.format(transcript=trimmed)
+
+
+def save_session_log(model_key, text, session_num, log_dir=None):
+    """Save session transcript to disk. Returns the log path or None."""
+    if not text:
+        return None
+    log_dir = log_dir or LOG_DIR
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{ts}_s{session_num:02d}_{model_key}.log"
+        path = os.path.join(log_dir, filename)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        return path
+    except OSError as e:
+        print_status(f"Warning: could not save log: {e}", YELLOW)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +520,61 @@ def show_model_menu(installed):
         print(f"  {RED}Invalid choice. Try again.{RESET}")
 
 
+def show_post_session_menu(installed, has_context):
+    """Show model picker after a session ends, with context carry option.
+
+    Returns (model_key, carry_context) or (None, False) to quit.
+    """
+    keys = list(installed.keys())
+
+    print(f"\n{BOLD}{'=' * 50}{RESET}")
+    print(f"{BOLD}  Session ended — pick next model or quit{RESET}")
+    print(f"{BOLD}{'=' * 50}{RESET}")
+    print(f"\n  Available models:\n")
+
+    for i, key in enumerate(keys, 1):
+        model = MODELS[key]
+        print(f"    {BOLD}{i}{RESET}) {model['display_name']:<15} ({key})")
+
+    print(f"\n    {BOLD}q{RESET}) Quit")
+    print()
+
+    while True:
+        try:
+            choice = input(f"  Select model [1-{len(keys)}/q]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None, False
+
+        if choice in ("q", "quit", "exit"):
+            return None, False
+
+        chosen_key = None
+
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(keys):
+                chosen_key = keys[idx]
+        elif choice in installed:
+            chosen_key = choice
+
+        if chosen_key is None:
+            print(f"  {RED}Invalid choice. Try again.{RESET}")
+            continue
+
+        # Ask about context carry
+        carry = False
+        if has_context:
+            try:
+                answer = input(f"  Carry context from previous session? [{GREEN}Y{RESET}/n]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return None, False
+            carry = answer != "n"
+
+        return chosen_key, carry
+
+
 def list_models():
     """Print all models and their install status, then exit."""
     print(f"\n{BOLD}Supported models:{RESET}\n")
@@ -347,6 +606,9 @@ Examples:
   claude-auto --no-bypass -M gemini    # Launch Gemini without --yolo
   claude-auto --no-loop                # Exit after first session (no menu loop)
   claude-auto --setup-only             # Just write settings, don't launch
+  claude-auto --no-capture             # Disable PTY capture (plain subprocess)
+  claude-auto --no-context             # Disable context handoff between sessions
+  claude-auto --log-dir /tmp/logs      # Custom session log directory
 
 Bypass mechanisms:
   Claude:  IS_SANDBOX=1, CLAUDE_CODE_BUBBLEWRAP=1, --dangerously-skip-permissions, settings.json
@@ -391,8 +653,29 @@ Bypass mechanisms:
         help="Skip writing settings.json (only use env vars + CLI flag)",
     )
 
+    parser.add_argument(
+        "--no-capture",
+        action="store_true",
+        help="Disable PTY capture (plain subprocess, no context handoff)",
+    )
+
+    parser.add_argument(
+        "--no-context",
+        action="store_true",
+        help="Disable context handoff between sessions (still saves logs)",
+    )
+
+    parser.add_argument(
+        "--log-dir",
+        metavar="DIR",
+        help="Custom directory for session logs (default: ~/.claude-auto/logs)",
+    )
+
     args, passthrough_args = parser.parse_known_args()
     bypass = not args.no_bypass
+    capture = not args.no_capture and not IS_WINDOWS
+    enable_context = not args.no_context and capture
+    log_dir = args.log_dir
 
     # --list-models: show and exit
     if args.list_models:
@@ -424,6 +707,9 @@ Bypass mechanisms:
     # --model flag: run that model once, no loop
     # only one model installed: run it once (backward compat), no loop
     # multiple models, no --model: show menu + loop
+    accumulated_context = ""
+    session_num = 0
+
     if args.model:
         if args.model not in installed:
             print_status(
@@ -431,32 +717,79 @@ Bypass mechanisms:
             )
             print_status("Run 'claude-auto --list-models' to see installed models", YELLOW)
             sys.exit(1)
-        run_session(args.model, installed[args.model], passthrough_args, bypass, args.no_settings)
+        session_num += 1
+        run_session(args.model, installed[args.model], passthrough_args,
+                    bypass, args.no_settings, capture=capture,
+                    log_dir=log_dir, session_num=session_num)
         sys.exit(0)
 
-    if len(installed) == 1:
-        # Single model — backward compatible behavior
+    if len(installed) == 1 and args.no_loop:
+        # Single model, no loop — backward compatible behavior
         key = next(iter(installed))
-        run_session(key, installed[key], passthrough_args, bypass, args.no_settings)
+        session_num += 1
+        run_session(key, installed[key], passthrough_args, bypass,
+                    args.no_settings, capture=capture, log_dir=log_dir,
+                    session_num=session_num)
         sys.exit(0)
 
-    # Multiple models — interactive menu loop
-    while True:
+    # Interactive menu loop (multiple models, or single model with loop enabled)
+    # First session: use the initial model menu
+    model_key = None
+    if len(installed) == 1:
+        model_key = next(iter(installed))
+    else:
         model_key = show_model_menu(installed)
-        if model_key is None:
-            print_status("Goodbye!", GREEN)
-            break
 
-        run_session(model_key, installed[model_key], passthrough_args, bypass, args.no_settings)
+    while model_key is not None:
+        session_num += 1
+
+        context_prompt = None
+        if enable_context and accumulated_context:
+            context_prompt = format_handoff_prompt(accumulated_context)
+
+        exit_code, captured = run_session(
+            model_key, installed[model_key], passthrough_args, bypass,
+            args.no_settings, context_prompt=context_prompt, capture=capture,
+            log_dir=log_dir, session_num=session_num,
+        )
+
+        # Accumulate context
+        if captured and enable_context:
+            accumulated_context += (
+                f"--- Session {session_num}: {model_key} ---\n"
+                f"{captured}\n"
+                f"--- End Session {session_num} ---\n\n"
+            )
 
         if args.no_loop:
             break
 
-        print_status("Session ended. Returning to model menu...\n", CYAN)
+        # Post-session menu
+        has_context = bool(accumulated_context) and enable_context
+        model_key, carry = show_post_session_menu(installed, has_context)
+
+        if model_key is None:
+            print_status("Goodbye!", GREEN)
+            break
+
+        if not carry:
+            accumulated_context = ""
+            print_status("Context cleared — starting fresh.", CYAN)
+        else:
+            ctx_len = len(accumulated_context)
+            print_status(
+                f"Carrying {ctx_len:,} chars of context to next session.",
+                GREEN,
+            )
 
 
-def run_session(model_key, exe_path, extra_args, bypass, no_settings):
-    """Set up and run a single CLI session."""
+def run_session(model_key, exe_path, extra_args, bypass, no_settings,
+                 context_prompt=None, capture=True, log_dir=None,
+                 session_num=1):
+    """Set up and run a single CLI session.
+
+    Returns (exit_code, captured_text_or_empty_string).
+    """
     model = MODELS[model_key]
     print_status(f"Model: {BOLD}{model['display_name']}{RESET} ({exe_path})")
 
@@ -475,14 +808,43 @@ def run_session(model_key, exe_path, extra_args, bypass, no_settings):
     else:
         print_status(f"BYPASS MODE: {RED}OFF{RESET} (normal {model_key})", YELLOW)
 
-    cmd = build_cmd(model_key, exe_path, extra_args, bypass)
-    print_status(f"Launching: {' '.join(cmd)}")
+    if context_prompt:
+        print_status("Context from previous session will be injected", CYAN)
 
-    try:
-        result = subprocess.run(cmd)
-        return result.returncode or 0
-    except KeyboardInterrupt:
-        return 130
+    cmd = build_cmd(model_key, exe_path, extra_args, bypass,
+                    context_prompt=context_prompt)
+    print_status(f"Launching: {' '.join(cmd[:4])}{'...' if len(cmd) > 4 else ''}")
+
+    captured_text = ""
+
+    # Try PTY capture on Unix
+    if capture and not IS_WINDOWS:
+        try:
+            exit_code, raw = run_session_pty(cmd)
+            captured_text = strip_ansi(raw)
+        except Exception as e:
+            print_status(f"PTY capture failed ({e}), falling back to subprocess", YELLOW)
+            try:
+                result = subprocess.run(cmd)
+                exit_code = result.returncode or 0
+            except KeyboardInterrupt:
+                exit_code = 130
+    else:
+        # Windows or --no-capture: plain subprocess
+        try:
+            result = subprocess.run(cmd)
+            exit_code = result.returncode or 0
+        except KeyboardInterrupt:
+            exit_code = 130
+
+    # Save session log
+    if captured_text:
+        log_path = save_session_log(model_key, captured_text, session_num,
+                                    log_dir=log_dir)
+        if log_path:
+            print_status(f"Session log saved: {log_path}", GREEN)
+
+    return exit_code, captured_text
 
 
 if __name__ == "__main__":
