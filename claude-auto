@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import platform
 import errno
+import time
 from datetime import datetime
 
 IS_WINDOWS = platform.system() == "Windows"
@@ -37,20 +38,40 @@ if IS_WINDOWS:
         RED = "\033[91m"
         CYAN = "\033[96m"
         BOLD = "\033[1m"
+        DIM = "\033[2m"
         RESET = "\033[0m"
+        WHITE = "\033[97m"
     except ImportError:
-        GREEN = YELLOW = RED = CYAN = BOLD = RESET = ""
+        GREEN = YELLOW = RED = CYAN = BOLD = DIM = RESET = WHITE = ""
 else:
     GREEN = "\033[92m"
     YELLOW = "\033[93m"
     RED = "\033[91m"
     CYAN = "\033[96m"
     BOLD = "\033[1m"
+    DIM = "\033[2m"
     RESET = "\033[0m"
+    WHITE = "\033[97m"
+
+# Box-drawing characters (Unicode)
+BOX_TL = "\u2554"  # ╔
+BOX_TR = "\u2557"  # ╗
+BOX_BL = "\u255a"  # ╚
+BOX_BR = "\u255d"  # ╝
+BOX_H  = "\u2550"  # ═
+BOX_V  = "\u2551"  # ║
+BOX_LT = "\u2560"  # ╠
+BOX_RT = "\u2563"  # ╣
+
+# Sticky header configuration
+HEADER_ROWS = 3  # Rows reserved for the sticky prompt header
 
 # ---------------------------------------------------------------------------
 # Session capture & context handoff constants
 # ---------------------------------------------------------------------------
+SWITCH_KEY = b"\x1d"        # Ctrl+]
+SWITCH_KEY_NAME = "Ctrl+]"  # for display
+
 MAX_CONTEXT_CHARS = 50000
 LOG_DIR = os.path.expanduser("~/.claude-auto/logs")
 
@@ -74,6 +95,8 @@ _ANSI_RE = re.compile(
     r"|\x1b\[[\?]?[0-9;]*[hlsr]"    # mode set/reset
     r")"
 )
+
+_ANSI_COLOR_RE = re.compile(r'\033\[[0-9;]*[A-Za-z]|\033\][^\x07]*\x07')
 
 # ---------------------------------------------------------------------------
 # Model definitions — all model-specific logic is driven from this dict
@@ -163,9 +186,127 @@ MODELS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Terminal & display helpers
+# ---------------------------------------------------------------------------
+
+def get_term_size():
+    """Get terminal (rows, cols), defaulting to (24, 80)."""
+    try:
+        size = os.get_terminal_size()
+        return size.lines, size.columns
+    except (OSError, ValueError):
+        return 24, 80
+
+
+def _visible_len(s):
+    """Visible length of a string, excluding ANSI escape sequences."""
+    return len(_ANSI_COLOR_RE.sub('', s))
+
+
 def print_status(msg, color=CYAN):
     sys.stderr.write(f"{color}[claude-auto]{RESET} {msg}\n")
     sys.stderr.flush()
+
+
+def set_terminal_title(text):
+    """Set terminal window/tab title via OSC escape sequence."""
+    try:
+        os.write(sys.stdout.fileno(), f"\033]2;claude-auto: {text}\007".encode())
+    except OSError:
+        pass
+
+
+def draw_full_width_box(title, body_lines, border_color=CYAN, title_color=None):
+    """Draw a full-width Unicode box to stdout."""
+    _, cols = get_term_size()
+    if title_color is None:
+        title_color = f"{BOLD}{WHITE}"
+    inner = max(cols - 2, 20)
+
+    # Top border with embedded title
+    if title:
+        title_text = f" {title} "
+        fill = inner - len(title_text) - 1
+        if fill < 0:
+            title_text = title_text[:inner + 1]
+            fill = 0
+        top = (
+            f"{border_color}{BOX_TL}{BOX_H}"
+            f"{title_color}{title_text}"
+            f"{border_color}{BOX_H * fill}{BOX_TR}{RESET}"
+        )
+    else:
+        top = f"{border_color}{BOX_TL}{BOX_H * inner}{BOX_TR}{RESET}"
+
+    bot = f"{border_color}{BOX_BL}{BOX_H * inner}{BOX_BR}{RESET}"
+    sep = f"{border_color}{BOX_LT}{BOX_H * inner}{BOX_RT}{RESET}"
+
+    output = [top]
+    # Max visible chars for body content: inner width minus the leading space
+    max_content_vlen = inner - 1
+    for line in body_lines:
+        if line == "---":
+            output.append(sep)
+            continue
+        vlen = _visible_len(line)
+        # Truncate lines that would overflow the box
+        if vlen > max_content_vlen:
+            # Strip ANSI, truncate visible text, add ellipsis
+            plain = _ANSI_COLOR_RE.sub('', line)
+            line = plain[:max_content_vlen - 3] + "..."
+            vlen = len(line)
+        pad_right = inner - 1 - vlen
+        if pad_right < 0:
+            pad_right = 0
+        output.append(
+            f"{border_color}{BOX_V}{RESET} {line}"
+            f"{' ' * pad_right}"
+            f"{border_color}{BOX_V}{RESET}"
+        )
+    output.append(bot)
+
+    print("\n".join(output))
+
+
+def build_header_bytes(prompt_text, model_name, cols):
+    """Build the 3-line sticky header as raw bytes for terminal output."""
+    inner = max(cols - 2, 20)
+
+    if not prompt_text:
+        prompt_text = "Waiting for input..."
+
+    # Top line with model name badge
+    badge = f" {model_name} "
+    fill = inner - len(badge) - 1
+    if fill < 0:
+        badge = badge[:inner + 1]
+        fill = 0
+    top = f"{BOX_TL}{BOX_H}{badge}{BOX_H * fill}{BOX_TR}"
+
+    # Middle line with current prompt
+    content = f" WORKING ON: {prompt_text}"
+    if len(content) > inner:
+        content = content[:inner - 3] + "..."
+    content = content.ljust(inner)
+    mid = f"{BOX_V}{content}{BOX_V}"
+
+    # Bottom line
+    bot = f"{BOX_BL}{BOX_H * inner}{BOX_BR}"
+
+    # Compose with colors: yellow border, white-on-blue content
+    Y = "\033[1;93m"   # bold bright yellow
+    W = "\033[1;97;44m" # bold white on blue background
+    R = "\033[0m"
+
+    header = (
+        f"\033[s"                        # save cursor
+        f"\033[1;1H\033[2K{Y}{top}{R}"   # row 1: erase line, then top border
+        f"\033[2;1H\033[2K{W}{mid}{R}"   # row 2: erase line, then prompt content
+        f"\033[3;1H\033[2K{Y}{bot}{R}"   # row 3: erase line, then bottom border
+        f"\033[u"                        # restore cursor
+    )
+    return header.encode()
 
 
 # ---------------------------------------------------------------------------
@@ -199,8 +340,7 @@ def find_executable(model_key):
             ["npm", "root", "-g"], capture_output=True, text=True
         )
         if result.returncode == 0:
-            # The executable name is the first entry without .exe
-            exe_name = model["executables"][-1]  # e.g. "claude", "gemini", "codex"
+            exe_name = model["executables"][-1]
             npm_path = os.path.join(result.stdout.strip(), ".bin", exe_name)
             if os.path.isfile(npm_path):
                 return npm_path
@@ -273,7 +413,6 @@ def setup_settings(model_key):
     desired = settings_spec["content"]
     changed = False
 
-    # Deep-merge top-level keys from desired into settings
     for key, value in desired.items():
         if isinstance(value, dict):
             if key not in settings:
@@ -311,50 +450,91 @@ def build_cmd(model_key, exe_path, extra_args, bypass=True, context_prompt=None)
         mode = model.get("context_inject", "positional")
         if mode == "flag_interactive":
             cmd.extend(["-i", context_prompt])
-        else:  # positional
+        else:
             cmd.append(context_prompt)
 
     return cmd
 
 
 # ---------------------------------------------------------------------------
-# PTY session capture (Unix only)
+# PTY session capture with sticky header (Unix only)
 # ---------------------------------------------------------------------------
 
-def run_session_pty(cmd):
+def run_session_pty(cmd, model_name="AI Agent", initial_prompt=""):
     """Run cmd under a PTY, proxying I/O and capturing child output.
 
-    Returns (exit_code, captured_bytes).
+    Features a sticky header at the top showing the current prompt,
+    scroll region to protect the header, and terminal title updates.
+
+    Returns (exit_code, captured_bytes, switch_requested).
     """
     captured = bytearray()
+    switch_requested = False
 
     pid, master_fd = pty.fork()
     if pid == 0:
-        # Child — exec the command
         os.execvp(cmd[0], cmd)
-        # unreachable unless exec fails
         os._exit(127)
 
-    # Parent — proxy stdin↔master_fd, tee output
     old_attrs = termios.tcgetattr(sys.stdin.fileno())
 
+    # Terminal state
+    rows, cols = get_term_size()
+    child_rows = max(rows - HEADER_ROWS, 10)
+
+    # Header state
+    current_prompt = initial_prompt
+    stdin_line_buf = bytearray()
+    alt_screen_active = False
+    last_header_draw = 0.0
+    HEADER_REDRAW_INTERVAL = 2.0
+
     def _sigwinch(signum, frame):
-        """Forward terminal resize to child PTY."""
+        """Forward terminal resize to child PTY and redraw header."""
+        nonlocal rows, cols, child_rows
         try:
-            rows, cols = os.get_terminal_size()
-            winsize = struct.pack("HHHH", rows, cols, 0, 0)
+            rows, cols = get_term_size()
+            child_rows = max(rows - HEADER_ROWS, 10)
+            winsize = struct.pack("HHHH", child_rows, cols, 0, 0)
             fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize)
             os.kill(pid, signal.SIGWINCH)
+            if not alt_screen_active:
+                os.write(
+                    sys.stdout.fileno(),
+                    f"\033[{HEADER_ROWS + 1};{rows}r".encode(),
+                )
+                header = build_header_bytes(current_prompt, model_name, cols)
+                os.write(sys.stdout.fileno(), header)
         except (OSError, ValueError):
             pass
 
     prev_handler = signal.signal(signal.SIGWINCH, _sigwinch)
 
-    # Send initial size
+    # Set child PTY size (reduced by header rows)
     try:
-        rows, cols = os.get_terminal_size()
-        winsize = struct.pack("HHHH", rows, cols, 0, 0)
+        winsize = struct.pack("HHHH", child_rows, cols, 0, 0)
         fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize)
+    except (OSError, ValueError):
+        pass
+
+    # Clear screen, draw initial header and set scroll region
+    try:
+        # Clear screen first to prevent residual content from previous renders
+        os.write(sys.stdout.fileno(), b"\033[2J\033[H")
+        header = build_header_bytes(current_prompt, model_name, cols)
+        os.write(sys.stdout.fileno(), header)
+        # Set scroll region: rows below header to bottom of terminal
+        os.write(
+            sys.stdout.fileno(),
+            f"\033[{HEADER_ROWS + 1};{rows}r".encode(),
+        )
+        # Move cursor into the scroll region
+        os.write(
+            sys.stdout.fileno(),
+            f"\033[{HEADER_ROWS + 1};1H".encode(),
+        )
+        set_terminal_title(current_prompt or model_name)
+        last_header_draw = time.monotonic()
     except (OSError, ValueError):
         pass
 
@@ -363,13 +543,29 @@ def run_session_pty(cmd):
 
         while True:
             try:
-                ready, _, _ = select.select([sys.stdin, master_fd], [], [], 0.1)
+                ready, _, _ = select.select(
+                    [sys.stdin, master_fd], [], [], 0.1
+                )
             except (select.error, OSError) as e:
                 if getattr(e, "errno", None) == errno.EINTR or (
                     isinstance(e, OSError) and e.errno == errno.EINTR
                 ):
                     continue
                 raise
+
+            now = time.monotonic()
+
+            # Periodic header redraw during idle (non-alt-screen)
+            if not ready and not alt_screen_active:
+                if (now - last_header_draw) >= HEADER_REDRAW_INTERVAL:
+                    try:
+                        header = build_header_bytes(
+                            current_prompt, model_name, cols
+                        )
+                        os.write(sys.stdout.fileno(), header)
+                        last_header_draw = now
+                    except OSError:
+                        pass
 
             if master_fd in ready:
                 try:
@@ -378,6 +574,26 @@ def run_session_pty(cmd):
                     break
                 if not data:
                     break
+
+                # Detect alternate screen buffer enter/exit
+                if b'\033[?1049h' in data or b'\033[?47h' in data:
+                    alt_screen_active = True
+                if b'\033[?1049l' in data or b'\033[?47l' in data:
+                    alt_screen_active = False
+                    try:
+                        rows, cols = get_term_size()
+                        os.write(
+                            sys.stdout.fileno(),
+                            f"\033[{HEADER_ROWS + 1};{rows}r".encode(),
+                        )
+                        header = build_header_bytes(
+                            current_prompt, model_name, cols
+                        )
+                        os.write(sys.stdout.fileno(), header)
+                        last_header_draw = now
+                    except OSError:
+                        pass
+
                 captured.extend(data)
                 os.write(sys.stdout.fileno(), data)
 
@@ -388,10 +604,103 @@ def run_session_pty(cmd):
                     break
                 if not data:
                     break
+
+                # Check for model switch key
+                if SWITCH_KEY in data:
+                    switch_requested = True
+                    termios.tcsetattr(
+                        sys.stdin.fileno(), termios.TCSAFLUSH, old_attrs
+                    )
+                    # Restore full scroll region and clear header
+                    try:
+                        os.write(
+                            sys.stdout.fileno(),
+                            f"\033[1;{rows}r".encode(),
+                        )
+                        for row in range(1, HEADER_ROWS + 1):
+                            os.write(
+                                sys.stdout.fileno(),
+                                f"\033[{row};1H\033[2K".encode(),
+                            )
+                    except OSError:
+                        pass
+                    os.write(sys.stdout.fileno(), b"\r\n")
+                    print_status(
+                        f"Switch triggered ({SWITCH_KEY_NAME}) "
+                        f"— ending session...",
+                        YELLOW,
+                    )
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except OSError:
+                        pass
+                    for _ in range(20):
+                        pid_result, _ = os.waitpid(pid, os.WNOHANG)
+                        if pid_result != 0:
+                            break
+                        time.sleep(0.1)
+                    else:
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except OSError:
+                            pass
+                    break
+
+                # Track user input to detect prompt submissions
+                for b_val in data:
+                    if b_val in (0x0d, 0x0a):  # Enter
+                        if stdin_line_buf:
+                            new_prompt = stdin_line_buf.decode(
+                                'utf-8', errors='replace'
+                            ).strip()
+                            if new_prompt and len(new_prompt) > 2:
+                                current_prompt = new_prompt
+                                set_terminal_title(current_prompt)
+                                if not alt_screen_active:
+                                    try:
+                                        header = build_header_bytes(
+                                            current_prompt, model_name, cols
+                                        )
+                                        os.write(
+                                            sys.stdout.fileno(), header
+                                        )
+                                        last_header_draw = now
+                                    except OSError:
+                                        pass
+                            stdin_line_buf.clear()
+                    elif b_val in (0x7f, 0x08):  # Backspace / DEL
+                        if stdin_line_buf:
+                            stdin_line_buf.pop()
+                    elif b_val == 0x03:  # Ctrl+C — clear input buffer
+                        stdin_line_buf.clear()
+                    elif b_val >= 0x20:  # Printable character
+                        stdin_line_buf.append(b_val)
+
                 os.write(master_fd, data)
     finally:
-        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_attrs)
+        if not switch_requested:
+            termios.tcsetattr(
+                sys.stdin.fileno(), termios.TCSADRAIN, old_attrs
+            )
         signal.signal(signal.SIGWINCH, prev_handler)
+        # Restore full scroll region, clear header area, and clear terminal title
+        try:
+            rows, _ = get_term_size()
+            os.write(sys.stdout.fileno(), f"\033[1;{rows}r".encode())
+            # Clear the sticky header rows to prevent residual text
+            for row in range(1, HEADER_ROWS + 1):
+                os.write(
+                    sys.stdout.fileno(),
+                    f"\033[{row};1H\033[2K".encode(),
+                )
+            # Move cursor below the cleared header area
+            os.write(
+                sys.stdout.fileno(),
+                f"\033[{HEADER_ROWS + 1};1H".encode(),
+            )
+            os.write(sys.stdout.fileno(), b"\033]2;\007")
+        except OSError:
+            pass
 
     # Drain remaining output
     while True:
@@ -411,10 +720,13 @@ def run_session_pty(cmd):
     except OSError:
         pass
 
-    _, status = os.waitpid(pid, 0)
-    exit_code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1
+    try:
+        _, status = os.waitpid(pid, 0)
+        exit_code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1
+    except ChildProcessError:
+        exit_code = 0
 
-    return exit_code, bytes(captured)
+    return exit_code, bytes(captured), switch_requested
 
 
 # ---------------------------------------------------------------------------
@@ -428,10 +740,8 @@ def strip_ansi(raw_bytes):
     except Exception:
         text = raw_bytes.decode("latin-1", errors="replace")
     text = _ANSI_RE.sub("", text)
-    # Remove remaining control chars but keep \n and \t
     text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
     text = text.replace("\r", "")
-    # Collapse runs of 3+ blank lines to 2
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
@@ -441,12 +751,10 @@ def truncate_context(text, max_chars=MAX_CONTEXT_CHARS):
     if len(text) <= max_chars:
         return text
     truncated = text[-max_chars:]
-    # Try to break at a session boundary marker
     marker = truncated.find("\n--- Session ")
     if marker != -1 and marker < len(truncated) // 2:
         truncated = truncated[marker + 1:]
     else:
-        # Break at first newline
         nl = truncated.find("\n")
         if nl != -1 and nl < 200:
             truncated = truncated[nl + 1:]
@@ -478,28 +786,40 @@ def save_session_log(model_key, text, session_num, log_dir=None):
 
 
 # ---------------------------------------------------------------------------
-# Interactive model selection menu
+# Interactive model selection menu (full-width boxes)
 # ---------------------------------------------------------------------------
 
 def show_model_menu(installed):
     """Show interactive model picker. Returns chosen model_key or None to quit."""
     keys = list(installed.keys())
 
-    print(f"\n{BOLD}{'=' * 50}{RESET}")
-    print(f"{BOLD}  claude-auto — AI Coding CLI Launcher{RESET}")
-    print(f"{BOLD}{'=' * 50}{RESET}")
-    print(f"\n  Available models:\n")
-
+    body = [""]
     for i, key in enumerate(keys, 1):
         model = MODELS[key]
-        print(f"    {BOLD}{i}{RESET}) {model['display_name']:<15} ({key})")
+        body.append(
+            f"  {BOLD}{CYAN}{i}{RESET})  "
+            f"{BOLD}{model['display_name']:<15}{RESET} "
+            f"{DIM}({key}){RESET}"
+        )
+    body.append("")
+    body.append("---")
+    body.append(f"  {BOLD}{RED}q{RESET})  Quit")
+    body.append("")
 
-    print(f"\n    {BOLD}q{RESET}) Quit")
+    print()
+    draw_full_width_box(
+        "claude-auto \u2014 AI Coding CLI Launcher",
+        body,
+        border_color=CYAN,
+    )
     print()
 
     while True:
         try:
-            choice = input(f"  Select model [1-{len(keys)}/q]: ").strip().lower()
+            choice = input(
+                f"  {CYAN}{BOLD}\u276f{RESET} Select model "
+                f"[{BOLD}1-{len(keys)}{RESET}/q]: "
+            ).strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
             return None
@@ -507,13 +827,11 @@ def show_model_menu(installed):
         if choice in ("q", "quit", "exit"):
             return None
 
-        # Accept number
         if choice.isdigit():
             idx = int(choice) - 1
             if 0 <= idx < len(keys):
                 return keys[idx]
 
-        # Accept model name
         if choice in installed:
             return choice
 
@@ -527,21 +845,33 @@ def show_post_session_menu(installed, has_context):
     """
     keys = list(installed.keys())
 
-    print(f"\n{BOLD}{'=' * 50}{RESET}")
-    print(f"{BOLD}  Session ended — pick next model or quit{RESET}")
-    print(f"{BOLD}{'=' * 50}{RESET}")
-    print(f"\n  Available models:\n")
-
+    body = [""]
     for i, key in enumerate(keys, 1):
         model = MODELS[key]
-        print(f"    {BOLD}{i}{RESET}) {model['display_name']:<15} ({key})")
+        body.append(
+            f"  {BOLD}{CYAN}{i}{RESET})  "
+            f"{BOLD}{model['display_name']:<15}{RESET} "
+            f"{DIM}({key}){RESET}"
+        )
+    body.append("")
+    body.append("---")
+    body.append(f"  {BOLD}{RED}q{RESET})  Quit")
+    body.append("")
 
-    print(f"\n    {BOLD}q{RESET}) Quit")
+    print()
+    draw_full_width_box(
+        "Session ended \u2014 pick next model or quit",
+        body,
+        border_color=YELLOW,
+    )
     print()
 
     while True:
         try:
-            choice = input(f"  Select model [1-{len(keys)}/q]: ").strip().lower()
+            choice = input(
+                f"  {YELLOW}{BOLD}\u276f{RESET} Select model "
+                f"[{BOLD}1-{len(keys)}{RESET}/q]: "
+            ).strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
             return None, False
@@ -562,11 +892,13 @@ def show_post_session_menu(installed, has_context):
             print(f"  {RED}Invalid choice. Try again.{RESET}")
             continue
 
-        # Ask about context carry
         carry = False
         if has_context:
             try:
-                answer = input(f"  Carry context from previous session? [{GREEN}Y{RESET}/n]: ").strip().lower()
+                answer = input(
+                    f"  Carry context from previous session? "
+                    f"[{GREEN}Y{RESET}/n]: "
+                ).strip().lower()
             except (EOFError, KeyboardInterrupt):
                 print()
                 return None, False
@@ -577,14 +909,20 @@ def show_post_session_menu(installed, has_context):
 
 def list_models():
     """Print all models and their install status, then exit."""
-    print(f"\n{BOLD}Supported models:{RESET}\n")
+    body = [""]
     for key, model in MODELS.items():
         path = find_executable(key)
         if path:
-            status = f"{GREEN}FOUND{RESET}  {path}"
+            status = f"{GREEN}{BOLD}FOUND{RESET}  {DIM}{path}{RESET}"
         else:
-            status = f"{RED}NOT FOUND{RESET}"
-        print(f"  {model['display_name']:<15} ({key:<7})  {status}")
+            status = f"{RED}{BOLD}NOT FOUND{RESET}"
+        body.append(
+            f"  {model['display_name']:<15} {DIM}({key:<7}){RESET}  {status}"
+        )
+    body.append("")
+
+    print()
+    draw_full_width_box("Supported Models", body, border_color=CYAN)
     print()
 
 
@@ -703,10 +1041,6 @@ Bypass mechanisms:
         print_status("Setup complete. Run 'claude-auto' to launch.", GREEN)
         sys.exit(0)
 
-    # Determine if we loop or run once
-    # --model flag: run that model once, no loop
-    # only one model installed: run it once (backward compat), no loop
-    # multiple models, no --model: show menu + loop
     accumulated_context = ""
     session_num = 0
 
@@ -720,25 +1054,26 @@ Bypass mechanisms:
         session_num += 1
         run_session(args.model, installed[args.model], passthrough_args,
                     bypass, args.no_settings, capture=capture,
-                    log_dir=log_dir, session_num=session_num)
+                    log_dir=log_dir, session_num=session_num,
+                    show_switch_hint=False)
         sys.exit(0)
 
     if len(installed) == 1 and args.no_loop:
-        # Single model, no loop — backward compatible behavior
         key = next(iter(installed))
         session_num += 1
         run_session(key, installed[key], passthrough_args, bypass,
                     args.no_settings, capture=capture, log_dir=log_dir,
-                    session_num=session_num)
+                    session_num=session_num, show_switch_hint=False)
         sys.exit(0)
 
-    # Interactive menu loop (multiple models, or single model with loop enabled)
-    # First session: use the initial model menu
+    # Interactive menu loop
     model_key = None
     if len(installed) == 1:
         model_key = next(iter(installed))
     else:
         model_key = show_model_menu(installed)
+
+    show_hint = not args.no_loop
 
     while model_key is not None:
         session_num += 1
@@ -747,13 +1082,13 @@ Bypass mechanisms:
         if enable_context and accumulated_context:
             context_prompt = format_handoff_prompt(accumulated_context)
 
-        exit_code, captured = run_session(
+        exit_code, captured, switch_requested = run_session(
             model_key, installed[model_key], passthrough_args, bypass,
             args.no_settings, context_prompt=context_prompt, capture=capture,
             log_dir=log_dir, session_num=session_num,
+            show_switch_hint=show_hint,
         )
 
-        # Accumulate context
         if captured and enable_context:
             accumulated_context += (
                 f"--- Session {session_num}: {model_key} ---\n"
@@ -761,10 +1096,23 @@ Bypass mechanisms:
                 f"--- End Session {session_num} ---\n\n"
             )
 
+        if switch_requested:
+            print_status(f"Switch triggered ({SWITCH_KEY_NAME}) — pick next model", CYAN)
+            model_key = show_model_menu(installed)
+            if model_key is None:
+                print_status("Goodbye!", GREEN)
+                break
+            if accumulated_context and enable_context:
+                ctx_len = len(accumulated_context)
+                print_status(
+                    f"Carrying {ctx_len:,} chars of context to next session.",
+                    GREEN,
+                )
+            continue
+
         if args.no_loop:
             break
 
-        # Post-session menu
         has_context = bool(accumulated_context) and enable_context
         model_key, carry = show_post_session_menu(installed, has_context)
 
@@ -785,66 +1133,104 @@ Bypass mechanisms:
 
 def run_session(model_key, exe_path, extra_args, bypass, no_settings,
                  context_prompt=None, capture=True, log_dir=None,
-                 session_num=1):
+                 session_num=1, show_switch_hint=False):
     """Set up and run a single CLI session.
 
-    Returns (exit_code, captured_text_or_empty_string).
+    Returns (exit_code, captured_text_or_empty_string, switch_requested).
     """
     model = MODELS[model_key]
-    print_status(f"Model: {BOLD}{model['display_name']}{RESET} ({exe_path})")
 
     if bypass:
-        print_status(
-            f"BYPASS MODE: {GREEN}ON{RESET} ({model['bypass_flag']})", GREEN
-        )
-
         if is_root() and model["env_vars"]:
             print_status("Running as root — setting sandbox env vars", YELLOW)
-
         setup_environment(model_key)
-
         if not no_settings:
             setup_settings(model_key)
-    else:
-        print_status(f"BYPASS MODE: {RED}OFF{RESET} (normal {model_key})", YELLOW)
 
+    # Determine initial prompt for sticky header
+    initial_prompt = ""
     if context_prompt:
-        print_status("Context from previous session will be injected", CYAN)
+        initial_prompt = "Continuing from previous session"
+    for i, arg in enumerate(extra_args):
+        if arg in ("-p", "--prompt") and i + 1 < len(extra_args):
+            initial_prompt = extra_args[i + 1]
+            break
 
     cmd = build_cmd(model_key, exe_path, extra_args, bypass,
                     context_prompt=context_prompt)
-    print_status(f"Launching: {' '.join(cmd[:4])}{'...' if len(cmd) > 4 else ''}")
+
+    # Display session info in a nice box
+    body = []
+    body.append(f"  {DIM}Path:{RESET}     {exe_path}")
+    if bypass:
+        body.append(
+            f"  {DIM}Bypass:{RESET}   "
+            f"{GREEN}{BOLD}ON{RESET} "
+            f"{DIM}({model['bypass_flag']}){RESET}"
+        )
+    else:
+        body.append(f"  {DIM}Bypass:{RESET}   {RED}{BOLD}OFF{RESET}")
+    body.append(f"  {DIM}Session:{RESET}  #{session_num}")
+    if context_prompt:
+        body.append(
+            f"  {DIM}Context:{RESET}  "
+            f"{CYAN}Injecting from previous session{RESET}"
+        )
+    if initial_prompt and not context_prompt:
+        display_prompt = initial_prompt[:60]
+        if len(initial_prompt) > 60:
+            display_prompt += "..."
+        body.append(f"  {DIM}Prompt:{RESET}   {WHITE}{display_prompt}{RESET}")
+    if show_switch_hint:
+        body.append(
+            f"  {DIM}Tip:{RESET}      "
+            f"Press {BOLD}{SWITCH_KEY_NAME}{RESET} to switch models"
+        )
+
+    print()
+    draw_full_width_box(
+        f" {model['display_name']} ",
+        body,
+        border_color=GREEN,
+        title_color=f"{BOLD}{GREEN}",
+    )
+    print()
 
     captured_text = ""
+    switch_requested = False
 
-    # Try PTY capture on Unix
     if capture and not IS_WINDOWS:
         try:
-            exit_code, raw = run_session_pty(cmd)
+            exit_code, raw, switch_requested = run_session_pty(
+                cmd,
+                model_name=model['display_name'],
+                initial_prompt=initial_prompt,
+            )
             captured_text = strip_ansi(raw)
         except Exception as e:
-            print_status(f"PTY capture failed ({e}), falling back to subprocess", YELLOW)
+            print_status(
+                f"PTY capture failed ({e}), falling back to subprocess",
+                YELLOW,
+            )
             try:
                 result = subprocess.run(cmd)
                 exit_code = result.returncode or 0
             except KeyboardInterrupt:
                 exit_code = 130
     else:
-        # Windows or --no-capture: plain subprocess
         try:
             result = subprocess.run(cmd)
             exit_code = result.returncode or 0
         except KeyboardInterrupt:
             exit_code = 130
 
-    # Save session log
     if captured_text:
         log_path = save_session_log(model_key, captured_text, session_num,
                                     log_dir=log_dir)
         if log_path:
             print_status(f"Session log saved: {log_path}", GREEN)
 
-    return exit_code, captured_text
+    return exit_code, captured_text, switch_requested
 
 
 if __name__ == "__main__":
