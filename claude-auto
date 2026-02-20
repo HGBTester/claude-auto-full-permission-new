@@ -122,7 +122,7 @@ MODELS = {
             r"C:\Program Files (x86)\claude\claude.exe",
         ],
         "bypass_flag": "--dangerously-skip-permissions",
-        "env_vars": {"IS_SANDBOX": "1", "CLAUDE_CODE_BUBBLEWRAP": "1"},
+        "env_vars": {},
         "settings": {
             "config_dir_env": "CLAUDE_CONFIG_DIR",
             "config_dir_default": "~/.claude",
