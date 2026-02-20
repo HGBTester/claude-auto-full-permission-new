@@ -851,12 +851,12 @@ def show_model_menu(installed):
         model = MODELS[key]
         body.append(
             f"  {BOLD}{GREEN}{i}{RESET})  "
-            f"{BOLD}{WHITE}{model['display_name']:<15}{RESET} "
+            f"{BOLD}{YELLOW}{model['display_name']:<15}{RESET} "
             f"{CYAN}({key}){RESET}"
         )
     body.append("")
     body.append("---")
-    body.append(f"  {BOLD}{RED}q{RESET})  {WHITE}Quit{RESET}")
+    body.append(f"  {BOLD}{RED}q{RESET})  {YELLOW}Quit{RESET}")
     body.append("")
 
     print()
@@ -903,12 +903,12 @@ def show_post_session_menu(installed, has_context):
         model = MODELS[key]
         body.append(
             f"  {BOLD}{GREEN}{i}{RESET})  "
-            f"{BOLD}{WHITE}{model['display_name']:<15}{RESET} "
+            f"{BOLD}{YELLOW}{model['display_name']:<15}{RESET} "
             f"{CYAN}({key}){RESET}"
         )
     body.append("")
     body.append("---")
-    body.append(f"  {BOLD}{RED}q{RESET})  {WHITE}Quit{RESET}")
+    body.append(f"  {BOLD}{RED}q{RESET})  {YELLOW}Quit{RESET}")
     body.append("")
 
     print()
@@ -970,7 +970,7 @@ def list_models():
         else:
             status = f"{RED}{BOLD}NOT FOUND{RESET}"
         body.append(
-            f"  {BOLD}{WHITE}{model['display_name']:<15}{RESET} "
+            f"  {BOLD}{YELLOW}{model['display_name']:<15}{RESET} "
             f"{CYAN}({key:<14}){RESET}  {status}"
         )
     body.append("")
@@ -1215,7 +1215,7 @@ def run_session(model_key, exe_path, extra_args, bypass, no_settings,
 
     # Display session info in a nice box
     body = []
-    body.append(f"  {CYAN}Path:{RESET}     {WHITE}{exe_path}{RESET}")
+    body.append(f"  {CYAN}Path:{RESET}     {YELLOW}{exe_path}{RESET}")
     if bypass:
         body.append(
             f"  {CYAN}Bypass:{RESET}   "
@@ -1224,7 +1224,7 @@ def run_session(model_key, exe_path, extra_args, bypass, no_settings,
         )
     else:
         body.append(f"  {CYAN}Bypass:{RESET}   {RED}{BOLD}OFF{RESET}")
-    body.append(f"  {CYAN}Session:{RESET}  {WHITE}#{session_num}{RESET}")
+    body.append(f"  {CYAN}Session:{RESET}  {YELLOW}#{session_num}{RESET}")
     if context_prompt:
         body.append(
             f"  {CYAN}Context:{RESET}  "
@@ -1234,7 +1234,7 @@ def run_session(model_key, exe_path, extra_args, bypass, no_settings,
         display_prompt = initial_prompt[:60]
         if len(initial_prompt) > 60:
             display_prompt += "..."
-        body.append(f"  {CYAN}Prompt:{RESET}   {WHITE}{display_prompt}{RESET}")
+        body.append(f"  {CYAN}Prompt:{RESET}   {YELLOW}{display_prompt}{RESET}")
     if show_switch_hint:
         body.append(
             f"  {CYAN}Tip:{RESET}      "
