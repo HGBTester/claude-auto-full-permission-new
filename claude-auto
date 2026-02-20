@@ -850,13 +850,13 @@ def show_model_menu(installed):
     for i, key in enumerate(keys, 1):
         model = MODELS[key]
         body.append(
-            f"  {BOLD}{CYAN}{i}{RESET})  "
-            f"{BOLD}{model['display_name']:<15}{RESET} "
-            f"{DIM}({key}){RESET}"
+            f"  {BOLD}{GREEN}{i}{RESET})  "
+            f"{BOLD}{WHITE}{model['display_name']:<15}{RESET} "
+            f"{CYAN}({key}){RESET}"
         )
     body.append("")
     body.append("---")
-    body.append(f"  {BOLD}{RED}q{RESET})  Quit")
+    body.append(f"  {BOLD}{RED}q{RESET})  {WHITE}Quit{RESET}")
     body.append("")
 
     print()
@@ -902,13 +902,13 @@ def show_post_session_menu(installed, has_context):
     for i, key in enumerate(keys, 1):
         model = MODELS[key]
         body.append(
-            f"  {BOLD}{CYAN}{i}{RESET})  "
-            f"{BOLD}{model['display_name']:<15}{RESET} "
-            f"{DIM}({key}){RESET}"
+            f"  {BOLD}{GREEN}{i}{RESET})  "
+            f"{BOLD}{WHITE}{model['display_name']:<15}{RESET} "
+            f"{CYAN}({key}){RESET}"
         )
     body.append("")
     body.append("---")
-    body.append(f"  {BOLD}{RED}q{RESET})  Quit")
+    body.append(f"  {BOLD}{RED}q{RESET})  {WHITE}Quit{RESET}")
     body.append("")
 
     print()
@@ -966,11 +966,12 @@ def list_models():
     for key, model in MODELS.items():
         path = find_executable(key)
         if path:
-            status = f"{GREEN}{BOLD}FOUND{RESET}  {DIM}{path}{RESET}"
+            status = f"{GREEN}{BOLD}FOUND{RESET}  {CYAN}{path}{RESET}"
         else:
             status = f"{RED}{BOLD}NOT FOUND{RESET}"
         body.append(
-            f"  {model['display_name']:<15} {DIM}({key:<7}){RESET}  {status}"
+            f"  {BOLD}{WHITE}{model['display_name']:<15}{RESET} "
+            f"{CYAN}({key:<14}){RESET}  {status}"
         )
     body.append("")
 
@@ -1214,30 +1215,30 @@ def run_session(model_key, exe_path, extra_args, bypass, no_settings,
 
     # Display session info in a nice box
     body = []
-    body.append(f"  {DIM}Path:{RESET}     {exe_path}")
+    body.append(f"  {CYAN}Path:{RESET}     {WHITE}{exe_path}{RESET}")
     if bypass:
         body.append(
-            f"  {DIM}Bypass:{RESET}   "
+            f"  {CYAN}Bypass:{RESET}   "
             f"{GREEN}{BOLD}ON{RESET} "
-            f"{DIM}({model['bypass_flag']}){RESET}"
+            f"{CYAN}({model['bypass_flag']}){RESET}"
         )
     else:
-        body.append(f"  {DIM}Bypass:{RESET}   {RED}{BOLD}OFF{RESET}")
-    body.append(f"  {DIM}Session:{RESET}  #{session_num}")
+        body.append(f"  {CYAN}Bypass:{RESET}   {RED}{BOLD}OFF{RESET}")
+    body.append(f"  {CYAN}Session:{RESET}  {WHITE}#{session_num}{RESET}")
     if context_prompt:
         body.append(
-            f"  {DIM}Context:{RESET}  "
-            f"{CYAN}Injecting from previous session{RESET}"
+            f"  {CYAN}Context:{RESET}  "
+            f"{GREEN}Injecting from previous session{RESET}"
         )
     if initial_prompt and not context_prompt:
         display_prompt = initial_prompt[:60]
         if len(initial_prompt) > 60:
             display_prompt += "..."
-        body.append(f"  {DIM}Prompt:{RESET}   {WHITE}{display_prompt}{RESET}")
+        body.append(f"  {CYAN}Prompt:{RESET}   {WHITE}{display_prompt}{RESET}")
     if show_switch_hint:
         body.append(
-            f"  {DIM}Tip:{RESET}      "
-            f"Press {BOLD}{SWITCH_KEY_NAME}{RESET} to switch models"
+            f"  {CYAN}Tip:{RESET}      "
+            f"Press {BOLD}{YELLOW}{SWITCH_KEY_NAME}{RESET} to switch models"
         )
 
     print()
