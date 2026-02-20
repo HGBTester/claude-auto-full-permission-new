@@ -1,26 +1,24 @@
 #!/usr/bin/env python3
 """
-claude-auto: A cross-platform wrapper for claude CLI with auto-accept functionality.
+claude-auto: Cross-platform wrapper for Claude CLI that bypasses all permission prompts.
 
-When AUTO_ACCEPT is enabled, automatically selects the most aggressive option:
-- Prefers "Yes, and don't ask again" over simple "Yes"
-- Falls back to "Yes" if no "don't ask again" option exists
+Uses Claude Code's native bypass mechanism instead of fragile keystroke simulation.
+Works as root in containers by setting IS_SANDBOX=1 to unlock --dangerously-skip-permissions.
+
+Supports both full interactive sessions and one-shot (-p) prompts.
 """
 
 import argparse
+import json
 import os
 import sys
-import re
 import shutil
 import subprocess
-import threading
-import time
 import platform
 
-# Detect platform
 IS_WINDOWS = platform.system() == "Windows"
 
-# ANSI color codes (disabled on Windows CMD without colorama)
+# ANSI colors
 if IS_WINDOWS:
     try:
         import colorama
@@ -41,23 +39,19 @@ else:
 
 
 def print_status(msg, color=CYAN):
-    """Print status message to stderr."""
     sys.stderr.write(f"{color}[claude-auto]{RESET} {msg}\n")
     sys.stderr.flush()
 
 
 def find_claude():
     """Find claude executable in the system."""
-    # Common names for claude executable
     names = ["claude", "claude.exe"] if IS_WINDOWS else ["claude"]
 
-    # First try: use shutil.which (searches PATH)
     for name in names:
         path = shutil.which(name)
         if path:
             return path
 
-    # Second try: common installation locations
     if IS_WINDOWS:
         common_paths = [
             os.path.expandvars(r"%LOCALAPPDATA%\Programs\claude\claude.exe"),
@@ -81,353 +75,149 @@ def find_claude():
         if os.path.isfile(path) and os.access(path, os.X_OK):
             return path
 
-    # Third try: npm global
     try:
-        if IS_WINDOWS:
-            result = subprocess.run(["npm", "root", "-g"], capture_output=True, text=True)
-        else:
-            result = subprocess.run(["npm", "root", "-g"], capture_output=True, text=True)
+        result = subprocess.run(["npm", "root", "-g"], capture_output=True, text=True)
         if result.returncode == 0:
             npm_path = os.path.join(result.stdout.strip(), ".bin", "claude")
             if os.path.isfile(npm_path):
                 return npm_path
-    except:
+    except Exception:
         pass
 
     return None
 
 
-def analyze_prompt_options(text):
-    """
-    Analyze the prompt to determine the best option to select.
-    Returns the key to send (arrow down + enter, or just enter, etc.)
-
-    Strategy: Select the most aggressive option
-    - "don't ask again" > "Yes" > anything else
-    """
-    # Check for "don't ask again" patterns (usually option 2)
-    dont_ask_patterns = [
-        r"don't ask again",
-        r"don.t ask again",
-        r"always allow",
-        r"allow always",
-        r"remember this",
-        r"for this session",
-    ]
-
-    text_lower = text.lower()
-
-    # If there's a "don't ask again" type option, we want to select it
-    for pattern in dont_ask_patterns:
-        if re.search(pattern, text_lower):
-            # Usually option 2 is "don't ask again"
-            # Send down arrow then enter to select option 2
-            return "aggressive"
-
-    # Default: just press enter (selects option 1 which is usually "Yes")
-    return "default"
-
-
-def is_plan_mode(text):
-    """Check if claude is currently in plan mode."""
-    plan_mode_patterns = [
-        r'plan mode',
-        r'\[plan\]',
-        r'planning mode',
-        r'Plan:',
-        r'enter plan mode',
-        r'exiting plan mode',
-        r'plan file',
-    ]
-    text_lower = text.lower()
-    for pattern in plan_mode_patterns:
-        if re.search(pattern, text_lower):
-            return True
-    return False
-
-
-class OutputMonitor:
-    """Monitor output and auto-respond to prompts."""
-
-    def __init__(self, auto_accept=True):
-        self.auto_accept = auto_accept
-        self.buffer = ""
-        self.last_response_pos = 0
-        self.lock = threading.Lock()
-        self.response_cooldown = 0
-        self.in_plan_mode = False
-        self.pending_response = None
-        self.write_func = None
-
-    def _send_response_delayed(self, action):
-        """Send response after a delay (runs in separate thread)."""
-        # Wait for prompt to fully render
-        time.sleep(1.0)
-
-        if self.write_func is None:
-            return
-
-        if action == "aggressive":
-            # Send down arrow to move to option 2, then enter
-            self.write_func(b"\x1b[B")  # Down arrow
-            time.sleep(0.15)
-            self.write_func(b"\r")      # Enter
-            time.sleep(0.05)
-            self.write_func(b"\n")      # Newline as backup
-            print_status(f"Auto-selected: Option 2 (don't ask again)", GREEN)
-        else:
-            # Just press enter for option 1
-            self.write_func(b"\r")
-            time.sleep(0.05)
-            self.write_func(b"\n")      # Newline as backup
-            print_status(f"Auto-selected: Option 1 (Yes)", GREEN)
-
-    def process_output(self, data, write_func):
-        """Process output data and check for prompts."""
-        self.write_func = write_func
-
-        with self.lock:
-            self.buffer += data
-
-            # Keep buffer manageable
-            if len(self.buffer) > 10000:
-                self.buffer = self.buffer[-5000:]
-                self.last_response_pos = max(0, self.last_response_pos - 5000)
-
-            # Check for plan mode status changes
-            if is_plan_mode(data):
-                if not self.in_plan_mode:
-                    self.in_plan_mode = True
-                    print_status(f"Plan mode detected - auto-accept {YELLOW}PAUSED{RESET}", YELLOW)
-
-            # Detect exiting plan mode
-            if self.in_plan_mode and re.search(r'(exiting plan|exit plan|plan complete|approved)', data.lower()):
-                self.in_plan_mode = False
-                print_status(f"Plan mode ended - auto-accept {GREEN}RESUMED{RESET}", GREEN)
-
-            # Check for prompt in new content (only if NOT in plan mode)
-            if self.auto_accept and not self.in_plan_mode and time.time() > self.response_cooldown:
-                new_content = self.buffer[self.last_response_pos:]
-
-                # Wait for full prompt: "Do you want to proceed?" AND "Esc to cancel" (indicates menu is ready)
-                has_proceed = re.search(r'Do you want to proceed\?', new_content, re.IGNORECASE)
-                has_menu_ready = re.search(r'(Esc to cancel|Yes.*No|1\.\s*Yes)', new_content, re.IGNORECASE)
-
-                if has_proceed and has_menu_ready:
-                    # Determine best response
-                    action = analyze_prompt_options(new_content)
-
-                    # Mark as handled immediately to prevent duplicate responses
-                    self.last_response_pos = len(self.buffer)
-                    self.response_cooldown = time.time() + 3  # 3 second cooldown
-
-                    # Send response in separate thread to not block output
-                    response_thread = threading.Thread(
-                        target=self._send_response_delayed,
-                        args=(action,),
-                        daemon=True
-                    )
-                    response_thread.start()
-
-
-def run_claude_unix(claude_path, claude_args, auto_accept=True):
-    """Run claude on Unix/Linux/Mac with PTY."""
-    import pty
-    import select
-    import termios
-    import tty
-
-    cmd = [claude_path] + claude_args
-    print_status(f"Running: {' '.join(cmd)}")
-
-    # Create pseudo-terminal
-    master_fd, slave_fd = pty.openpty()
-
-    process = subprocess.Popen(
-        cmd,
-        stdin=slave_fd,
-        stdout=slave_fd,
-        stderr=slave_fd,
-        close_fds=True
-    )
-
-    os.close(slave_fd)
-
-    # Save terminal settings
-    old_settings = None
-    if sys.stdin.isatty():
-        old_settings = termios.tcgetattr(sys.stdin)
-        tty.setraw(sys.stdin.fileno())
-
-    monitor = OutputMonitor(auto_accept)
-
-    def write_to_master(data):
-        os.write(master_fd, data)
-
-    try:
-        while True:
-            rlist = [master_fd]
-            if sys.stdin.isatty():
-                rlist.append(sys.stdin)
-
-            try:
-                readable, _, _ = select.select(rlist, [], [], 0.1)
-            except:
-                break
-
-            if process.poll() is not None:
-                try:
-                    remaining = os.read(master_fd, 4096)
-                    if remaining:
-                        sys.stdout.buffer.write(remaining)
-                        sys.stdout.buffer.flush()
-                except:
-                    pass
-                break
-
-            if master_fd in readable:
-                try:
-                    data = os.read(master_fd, 4096)
-                    if not data:
-                        break
-
-                    sys.stdout.buffer.write(data)
-                    sys.stdout.buffer.flush()
-
-                    try:
-                        decoded = data.decode('utf-8', errors='replace')
-                        monitor.process_output(decoded, write_to_master)
-                    except:
-                        pass
-                except:
-                    break
-
-            if sys.stdin in readable:
-                try:
-                    user_input = os.read(sys.stdin.fileno(), 1024)
-                    if user_input:
-                        os.write(master_fd, user_input)
-                        monitor.last_response_pos = len(monitor.buffer)
-                except:
-                    break
-
-    except KeyboardInterrupt:
-        process.terminate()
-    finally:
-        if old_settings:
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-        os.close(master_fd)
-
-    return process.returncode or 0
-
-
-def run_claude_windows(claude_path, claude_args, auto_accept=True):
-    """Run claude on Windows."""
-    import msvcrt
-
-    cmd = [claude_path] + claude_args
-    print_status(f"Running: {' '.join(cmd)}")
-
-    # On Windows, we use subprocess with pipes and threads
-    process = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        bufsize=0
-    )
-
-    monitor = OutputMonitor(auto_accept)
-    stop_event = threading.Event()
-
-    def write_to_stdin(data):
+def is_root():
+    """Check if running as root/admin."""
+    if IS_WINDOWS:
         try:
-            process.stdin.write(data)
-            process.stdin.flush()
-        except:
+            import ctypes
+            return ctypes.windll.shell32.IsUserAnAdmin() != 0
+        except Exception:
+            return False
+    return os.getuid() == 0
+
+
+def setup_settings():
+    """Write ~/.claude/settings.json with bypass permissions as default mode.
+
+    This is a belt-and-suspenders approach: even if the CLI flag fails,
+    the settings file ensures bypass mode is the default.
+    """
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR", os.path.expanduser("~/.claude"))
+    settings_path = os.path.join(config_dir, "settings.json")
+
+    settings = {}
+    if os.path.isfile(settings_path):
+        try:
+            with open(settings_path, "r") as f:
+                settings = json.load(f)
+        except (json.JSONDecodeError, IOError):
             pass
 
-    def read_output():
-        """Read and display output from claude."""
-        while not stop_event.is_set():
-            try:
-                data = process.stdout.read(1)
-                if not data:
-                    break
+    changed = False
 
-                sys.stdout.buffer.write(data)
-                sys.stdout.buffer.flush()
+    # Set permissions.defaultMode to bypassPermissions
+    if "permissions" not in settings:
+        settings["permissions"] = {}
+    if settings["permissions"].get("defaultMode") != "bypassPermissions":
+        settings["permissions"]["defaultMode"] = "bypassPermissions"
+        changed = True
 
-                try:
-                    decoded = data.decode('utf-8', errors='replace')
-                    monitor.process_output(decoded, write_to_stdin)
-                except:
-                    pass
-            except:
-                break
+    # Allow all tool patterns
+    desired_allow = ["Bash(*)", "Edit", "Write", "Read", "Glob", "Grep",
+                     "WebFetch(*)", "WebSearch(*)", "NotebookEdit", "Task(*)",
+                     "Skill(*)"]
+    if settings["permissions"].get("allow") != desired_allow:
+        settings["permissions"]["allow"] = desired_allow
+        changed = True
 
-    def read_input():
-        """Read user input and send to claude."""
-        while not stop_event.is_set() and process.poll() is None:
-            try:
-                if msvcrt.kbhit():
-                    char = msvcrt.getch()
-                    process.stdin.write(char)
-                    process.stdin.flush()
-                    monitor.last_response_pos = len(monitor.buffer)
-                else:
-                    time.sleep(0.05)
-            except:
-                break
+    # Skip the "are you sure?" trust dialog
+    if settings.get("skipDangerousModePermissionPrompt") is not True:
+        settings["skipDangerousModePermissionPrompt"] = True
+        changed = True
 
-    # Start threads
-    output_thread = threading.Thread(target=read_output, daemon=True)
-    input_thread = threading.Thread(target=read_input, daemon=True)
+    if changed:
+        os.makedirs(config_dir, exist_ok=True)
+        with open(settings_path, "w") as f:
+            json.dump(settings, f, indent=2)
+        print_status(f"Settings written: {settings_path}", GREEN)
+    else:
+        print_status(f"Settings OK: {settings_path}", GREEN)
 
-    output_thread.start()
-    input_thread.start()
 
-    try:
-        process.wait()
-    except KeyboardInterrupt:
-        process.terminate()
-    finally:
-        stop_event.set()
+def setup_environment():
+    """Set environment variables needed for bypass as root."""
+    env_set = []
 
-    return process.returncode or 0
+    # IS_SANDBOX=1 unlocks --dangerously-skip-permissions for root
+    if os.environ.get("IS_SANDBOX") != "1":
+        os.environ["IS_SANDBOX"] = "1"
+        env_set.append("IS_SANDBOX=1")
+
+    # CLAUDE_CODE_BUBBLEWRAP=1 is the secondary check
+    if os.environ.get("CLAUDE_CODE_BUBBLEWRAP") != "1":
+        os.environ["CLAUDE_CODE_BUBBLEWRAP"] = "1"
+        env_set.append("CLAUDE_CODE_BUBBLEWRAP=1")
+
+    if env_set:
+        print_status(f"Environment: {', '.join(env_set)}", GREEN)
+
+
+def build_claude_cmd(claude_path, claude_args, bypass=True):
+    """Build the full command to launch claude."""
+    cmd = [claude_path]
+
+    if bypass:
+        # Only add if not already in user args
+        if "--dangerously-skip-permissions" not in claude_args:
+            cmd.append("--dangerously-skip-permissions")
+
+    cmd.extend(claude_args)
+    return cmd
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="claude-auto: Cross-platform Claude CLI wrapper with auto-accept",
+        description="claude-auto: Claude CLI wrapper with native permission bypass",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  claude-auto "fix the bug"           # Auto-accept ON (aggressive mode)
-  claude-auto --no-auto "fix bug"     # Auto-accept OFF (manual mode)
-  claude-auto -- --help               # Pass --help to claude
+  claude-auto                          # Full interactive session, all permissions bypassed
+  claude-auto "fix the bug"            # Interactive session with initial prompt
+  claude-auto -p "fix the bug"         # One-shot prompt mode (non-interactive)
+  claude-auto --no-bypass "fix bug"    # Disable bypass (fall back to normal claude)
+  claude-auto --setup-only             # Just write settings, don't launch claude
+  claude-auto -- --resume              # Pass flags directly to claude
 
-Auto-accept behavior:
-  - Detects "Do you want to proceed?" prompts
-  - Prefers "Yes, and don't ask again" (option 2) when available
-  - Falls back to "Yes" (option 1) otherwise
+Bypass method:
+  1. Sets IS_SANDBOX=1 + CLAUDE_CODE_BUBBLEWRAP=1 (unlocks bypass for root)
+  2. Passes --dangerously-skip-permissions to claude
+  3. Writes ~/.claude/settings.json with bypassPermissions as default mode
         """
     )
 
     parser.add_argument(
-        "--no-auto", "-n",
+        "--no-bypass", "-n",
         action="store_true",
-        help="Disable auto-accept (manual mode)"
+        help="Disable permission bypass (run claude normally)"
     )
 
     parser.add_argument(
-        "claude_args",
-        nargs="*",
-        help="Arguments to pass to claude"
+        "--setup-only",
+        action="store_true",
+        help="Only write settings.json and environment, don't launch claude"
     )
 
-    args = parser.parse_args()
-    auto_accept = not args.no_auto
+    parser.add_argument(
+        "--no-settings",
+        action="store_true",
+        help="Skip writing settings.json (only use env vars + CLI flag)"
+    )
+
+    # Use parse_known_args so unknown flags pass through to claude
+    args, claude_args = parser.parse_known_args()
+    bypass = not args.no_bypass
 
     # Find claude
     claude_path = find_claude()
@@ -438,18 +228,38 @@ Auto-accept behavior:
 
     print_status(f"Found claude: {claude_path}")
 
-    if auto_accept:
-        print_status(f"AUTO-ACCEPT: {GREEN}ON{RESET} (aggressive mode - prefers 'don't ask again')", GREEN)
-    else:
-        print_status(f"AUTO-ACCEPT: {RED}OFF{RESET} (manual mode)", YELLOW)
+    if bypass:
+        print_status(f"BYPASS MODE: {GREEN}ON{RESET} (native --dangerously-skip-permissions)", GREEN)
 
-    # Run with platform-specific implementation
+        if is_root():
+            print_status(f"Running as root - setting sandbox env vars", YELLOW)
+
+        setup_environment()
+
+        if not args.no_settings:
+            setup_settings()
+    else:
+        print_status(f"BYPASS MODE: {RED}OFF{RESET} (normal claude)", YELLOW)
+
+    if args.setup_only:
+        print_status("Setup complete. Run 'claude-auto' to launch.", GREEN)
+        sys.exit(0)
+
+    # Build command
+    cmd = build_claude_cmd(claude_path, claude_args, bypass)
+    print_status(f"Launching: {' '.join(cmd)}")
+
+    # Replace this process with claude (full interactive session)
+    # os.execvpe gives claude direct access to the terminal - no PTY wrapper needed
     if IS_WINDOWS:
-        exit_code = run_claude_windows(claude_path, args.claude_args, auto_accept)
+        # Windows doesn't support exec, use subprocess
+        try:
+            result = subprocess.run(cmd)
+            sys.exit(result.returncode or 0)
+        except KeyboardInterrupt:
+            sys.exit(130)
     else:
-        exit_code = run_claude_unix(claude_path, args.claude_args, auto_accept)
-
-    sys.exit(exit_code)
+        os.execvpe(cmd[0], cmd, os.environ)
 
 
 if __name__ == "__main__":
